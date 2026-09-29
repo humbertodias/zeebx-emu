@@ -13,9 +13,9 @@
 # cross-build de `unicorn` (QEMU em C) e `dynarmic` (C++20 com CMake) exigiria toolchain e sysroot
 # que ninguém quer manter só para empacotar. O Switch é a exceção: o `.a` sai da imagem
 # `devkitpro/devkita64`, pelo `frontends/switch/compilar.sh`. O Dreamcast sai como `.klf`, a
-# biblioteca que o KallistiOS carrega em tempo de execução. A cadeia (KallistiOS +
-# rustc_codegen_gcc) não está num runner: quem monta é o `frontends/dreamcast/compilar.sh`,
-# na máquina que já tem o dreamcast.rs.
+# biblioteca que o KallistiOS carrega em tempo de execução. Não há imagem pronta como a do
+# devkitA64: o job `core-dreamcast` monta a cadeia do dreamcast.rs no runner e chama o
+# `frontends/dreamcast/compilar.sh`.
 
 name: libretro
 
@@ -80,7 +80,7 @@ jobs:
             biblioteca: target/release/libzeebx_libretro.dylib
             pacote: zeebx_libretro.dylib
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -151,7 +151,7 @@ jobs:
           grep -q '^database = "Mobile - Zeebo"' pacote/zeebx_libretro.info
           ls -la pacote/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zeebx_libretro_${{ matrix.nome }}
           path: pacote/
@@ -162,7 +162,7 @@ jobs:
     name: core-wasm
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -176,7 +176,7 @@ jobs:
       - name: Compila o side module
         run: ./ferramentas/compilar_wasm.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zeebx_libretro_emscripten
           path: target/wasm/
@@ -198,7 +198,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             ca-certificates cmake curl git ninja-build pkg-config python3
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -223,7 +223,60 @@ jobs:
           fi
           echo "libzeebx_libretro.a é ELF AArch64"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zeebx_libretro_switch
           path: frontends/switch/saida/libzeebx_libretro.a
+
+  # Biblioteca que o KallistiOS abre com library_open. O rustc de fábrica não emite SH-4:
+  # a cadeia é a do dreamcast.rs (GCC sh-elf + rustc_codegen_gcc), e o compilar.sh liga o .klf.
+  dreamcast:
+    name: core-dreamcast
+    runs-on: ubuntu-24.04
+    # A primeira vez compila o GCC do SH-4 e o sysroot do Rust. As seguintes usam o cache.
+    timeout-minutes: 360
+    steps:
+      - name: Dependências da cadeia
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison bzip2 cmake curl diffutils flex gawk git \
+            libelf-dev libgmp-dev libisofs-dev libjpeg-dev libmpc-dev libmpfr-dev \
+            libpng-dev meson ninja-build patch pkg-config python3 tar texinfo \
+            wget gettext
+
+      - uses: actions/checkout@v7
+
+      # O cache grava em /opt, que o runner não deixa escrever até este chown.
+      - name: Diretório da cadeia
+        run: |
+          sudo mkdir -p /opt/toolchains/dc
+          sudo chown -R "$USER" /opt/toolchains/dc
+
+      - uses: actions/cache@v4
+        id: cadeia
+        with:
+          path: /opt/toolchains/dc/rust
+          key: libretro-dreamcast-toolchain-v1
+
+      - name: Instala a cadeia
+        if: steps.cadeia.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/dreamcast-rs/rust-for-dreamcast.git /opt/toolchains/dc/rust
+          git clone --depth 1 https://github.com/dreamcast-rs/KallistiOS.git /opt/toolchains/dc/rust/kos
+          # -j2: o runner tem pouca RAM para um GCC inteiro em todos os núcleos ao mesmo tempo.
+          /opt/toolchains/dc/rust/misc/install-toolchain.sh -j2
+          # shellcheck disable=SC1091
+          source /opt/toolchains/dc/rust/misc/environ.sh
+          make -C "$KOS_BASE" -j2
+          /opt/toolchains/dc/rust/misc/install-rust.sh
+
+      - name: Compila a biblioteca
+        run: ./frontends/dreamcast/compilar.sh --local
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zeebx_libretro_dreamcast
+          path: frontends/dreamcast/saida/zeebx_libretro.klf
+          if-no-files-found: error

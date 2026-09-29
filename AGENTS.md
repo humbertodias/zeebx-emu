@@ -96,7 +96,8 @@ release faz o mesmo e publica `zeebx_libretro-switch.zip`. O `.a` não liga sozi
 [`frontends/dreamcast/compilar.sh`](frontends/dreamcast/compilar.sh). O alvo é o `sh-elf` do
 [dreamcast.rs](https://dreamcast.rs/setup.html): KallistiOS e `rustc_codegen_gcc`, com
 `target_os = "kallistios"`. Nesse alvo o núcleo é o interpretador — o dynarmic não emite SH-4.
-Não há job no `libretro.yml`: a cadeia não está numa imagem de runner.
+O job `core-dreamcast` do `libretro.yml` monta essa cadeia no runner e publica
+`zeebx_libretro_dreamcast`. Não há imagem pronta, então a primeira execução compila o GCC.
 
 **iOS** precisa de um Mac com Xcode e dos alvos `aarch64-apple-ios` e
 `aarch64-apple-ios-sim` no rustup. O passo a passo está em
