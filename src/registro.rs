@@ -19,7 +19,9 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::atomo::AtomicU64;
 
 /// Quanto cabe no anel antes de o registro começar a descartar o mais antigo.
 ///

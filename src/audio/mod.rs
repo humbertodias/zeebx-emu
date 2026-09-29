@@ -570,8 +570,8 @@ pub struct Output {
 /// **É a medida do "nada toca".** O mixer pode render o som certo e mesmo assim o fluxo parar de
 /// ser alimentado — a placa deixa de pedir, e o que se ouve é só o que já estava no buffer dela:
 /// um pedaço, uma vez. Se este contador parar de crescer, o defeito está no fluxo, e não no motor.
-static PLACA_QUADROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PLACA_ULTIMO_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PLACA_QUADROS: crate::atomo::AtomicU64 = crate::atomo::AtomicU64::new(0);
+static PLACA_ULTIMO_MS: crate::atomo::AtomicU64 = crate::atomo::AtomicU64::new(0);
 static PLACA_RELOGIO: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 #[cfg(feature = "audio")]

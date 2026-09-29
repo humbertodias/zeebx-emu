@@ -12,7 +12,10 @@
 # Cada alvo roda no seu próprio runner: AArch64 Linux e Windows em runner ARM64 nativo, porque
 # cross-build de `unicorn` (QEMU em C) e `dynarmic` (C++20 com CMake) exigiria toolchain e sysroot
 # que ninguém quer manter só para empacotar. O Switch é a exceção: o `.a` sai da imagem
-# `devkitpro/devkita64`, pelo `frontends/switch/compilar.sh`.
+# `devkitpro/devkita64`, pelo `frontends/switch/compilar.sh`. O Dreamcast sai como `.klf`, a
+# biblioteca que o KallistiOS carrega em tempo de execução. A cadeia (KallistiOS +
+# rustc_codegen_gcc) não está num runner: quem monta é o `frontends/dreamcast/compilar.sh`,
+# na máquina que já tem o dreamcast.rs.
 
 name: libretro
 

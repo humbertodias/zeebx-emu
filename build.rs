@@ -6,4 +6,7 @@ fn main() {
     // O `frontends/switch/compilar.sh` passa `--cfg zeebx_switch`. Sem este aviso o rustc
     // trata o nome como desconhecido.
     println!("cargo::rustc-check-cfg=cfg(zeebx_switch)");
+    // O alvo do Dreamcast é um JSON com `os = "kallistios"`. Sem isto o rustc avisa que o
+    // valor não está na lista que ele conhece, em todo arquivo que escolhe o interpretador.
+    println!("cargo::rustc-check-cfg=cfg(target_os, values(\"kallistios\"))");
 }

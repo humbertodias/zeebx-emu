@@ -230,6 +230,12 @@ fn placa() -> Option<std::sync::Arc<glow::Context>> {
 /// No `libretro`, quem **oferece** é o core: ele preenche o struct e chama o ambiente. O frontend
 /// devolve `true` se aceitar, e depois disso ele cria o contexto e chama o nosso `context_reset`.
 fn pede_o_contexto_de_placa() {
+    // O Dreamcast não tem o OpenGL 3 que o motor pede, e o frontend de lá liga o core
+    // estaticamente. Pedir o contexto arrisca um aceite que entrega um GL que não é o nosso.
+    // O quadro sai pelo framebuffer de software.
+    if cfg!(target_os = "kallistios") {
+        return;
+    }
     if OFERTA_DE_PLACA.lock().is_ok_and(|g| g.is_some()) {
         return;
     }
@@ -885,9 +891,9 @@ fn log_com_nivel(nivel: u32, mensagem: &str) {
 /// O `av_info` declara 44100 quadros por segundo. Se o que sai daqui for outra coisa, o frontend
 /// reamostra — ou o buffer dele esvazia — e o sintoma é som agudo, rápido ou fatiado, sem que nada
 /// dentro do motor apareça. Uma linha por segundo responde isso em qualquer aparelho.
-static AUDIO_QUADROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static AUDIO_ANTERIOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static AUDIO_ULTIMO_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUDIO_QUADROS: zeebx::atomo::AtomicU64 = zeebx::atomo::AtomicU64::new(0);
+static AUDIO_ANTERIOR: zeebx::atomo::AtomicU64 = zeebx::atomo::AtomicU64::new(0);
+static AUDIO_ULTIMO_MS: zeebx::atomo::AtomicU64 = zeebx::atomo::AtomicU64::new(0);
 static AUDIO_RELOGIO: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Pede ao frontend o buffer em que o quadro deve ser desenhado.
@@ -2123,6 +2129,11 @@ fn retira_callback_de_audio() {
 /// sintetizador MIDI, e a releitura a quente, para o resto — e as duas tinham a mesma
 /// comparação escrita de novo. Duas cópias divergem com o tempo; uma função não.
 fn perfil_e_portatil(texto: Option<&str>) -> bool {
+    // 16 MB de RAM principal: o perfil de desktop (banco de amostras, cache de dezenas de
+    // megabytes, supersampling) não cabe. A opção do frontend não pode ligar isso de volta.
+    if cfg!(target_os = "kallistios") {
+        return true;
+    }
     texto.is_some_and(|texto| texto.trim().eq_ignore_ascii_case("portatil"))
 }
 
@@ -2258,7 +2269,10 @@ fn aplica_opcoes_quentes(estado: &mut Core) {
     {
         zeebx::audio::soundfont::define_efeitos(efeitos);
     }
-    let mib = if perfil_portatil {
+    let mib = if cfg!(target_os = "kallistios") {
+        // O perfil Portátil pede 8 MB, que já é metade da RAM. O piso do motor é 1 MB.
+        Some(1)
+    } else if perfil_portatil {
         Some(8)
     } else {
         unsafe { le_opcao(c"zeebx_cache_de_som_mb") }
@@ -2320,6 +2334,35 @@ fn opcoes_mudaram() -> bool {
         )
     };
     mudou
+}
+
+/// O KallistiOS recusa o ELF se estes quatro símbolos não existirem.
+///
+/// `elf_load` procura os quatro pelo nome e, na falta de um, descarta o arquivo. Não são a ABI
+/// do core — o frontend acha `retro_*` na tabela de símbolos do mesmo ELF. Devolver zero em
+/// `lib_open` é o que o carregador trata como sucesso.
+#[cfg(target_os = "kallistios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn lib_get_name() -> *const c_char {
+    c"zeebx".as_ptr()
+}
+
+#[cfg(target_os = "kallistios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn lib_get_version() -> u32 {
+    1
+}
+
+#[cfg(target_os = "kallistios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn lib_open(_lib: *mut c_void) -> i32 {
+    0
+}
+
+#[cfg(target_os = "kallistios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn lib_close(_lib: *mut c_void) -> i32 {
+    0
 }
 
 /// `retro_api_version`.

@@ -8,7 +8,9 @@
 
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+
+use crate::atomo::AtomicU64;
 
 use crate::config;
 use crate::loader::miffile::MifFile;

@@ -2,6 +2,7 @@
 //!
 //! O motor é compartilhado pelo desktop, Libretro, headless, Android e iOS.
 
+pub mod atomo;
 pub mod audio;
 pub mod brew;
 pub mod config;

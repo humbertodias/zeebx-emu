@@ -5,12 +5,16 @@ use super::*;
 /// Quantos sons decodificados o cache guarda antes de esquecer os que ninguém usa. Ver
 /// [`Machine::descarta_sons_sem_dono`].
 ///
-/// No Switch, 64 entradas descartam uma trilha que ninguém está tocando e a próxima
-/// reprodução sintetiza de novo. O teto em bytes continua sendo o limite de memória.
-#[cfg(zeebx_switch)]
+/// No Switch, menos entradas descartam uma trilha que ninguém está tocando e a próxima
+/// reprodução sintetiza de novo; o `cfg(zeebx_switch)` aumenta o número. O teto em bytes
+/// continua sendo o limite de memória.
+#[cfg(all(zeebx_switch, not(target_os = "kallistios")))]
 const MAX_SONS_GUARDADOS: usize = 512;
-#[cfg(not(zeebx_switch))]
+#[cfg(not(any(zeebx_switch, target_os = "kallistios")))]
 const MAX_SONS_GUARDADOS: usize = 64;
+/// 16 MB de RAM principal: cada entrada guardada compete com o interpretador.
+#[cfg(target_os = "kallistios")]
+const MAX_SONS_GUARDADOS: usize = 8;
 
 /// Quanto de PCM decodificado o cache guarda, em bytes, antes de esquecer os que ninguém usa.
 ///
@@ -24,7 +28,13 @@ const MAX_SONS_GUARDADOS: usize = 64;
 /// banco a 44.100 em vez de 22.050 **dobra** o PCM de cada música. Num aparelho de mão o que
 /// sobra de RAM é pouco, e o custo de esquecer é uma re-síntese; o custo de não esquecer é o
 /// sistema matar o processo.
+#[cfg(not(target_os = "kallistios"))]
 const MAX_BYTES_DE_SOM: usize = 24 * 1024 * 1024;
+/// Uma trilha longa a 44.100 Hz em `f32` passa de 19 MB. No Dreamcast isso é maior que a
+/// RAM principal (16 MB), então o teto de fábrica fica no piso de [`define_teto_do_cache_de_som`]:
+/// esquecer e sintetizar de novo cabe; guardar a trilha inteira, não.
+#[cfg(target_os = "kallistios")]
+const MAX_BYTES_DE_SOM: usize = 1024 * 1024;
 
 /// O teto escolhido agora, que começa em [`MAX_BYTES_DE_SOM`] e o frontend pode mudar.
 ///

@@ -83,7 +83,7 @@ pub struct Framebuffer {
 }
 
 /// De onde sai a [`Framebuffer::versao`] de cada superfície nova.
-static PROXIMA_SERIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static PROXIMA_SERIE: crate::atomo::AtomicU64 = crate::atomo::AtomicU64::new(1);
 
 impl Framebuffer {
     pub fn new(width: u32, height: u32) -> Self {
