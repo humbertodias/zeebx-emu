@@ -38,8 +38,12 @@ preparar_ambiente() {
 		echo "A cadeia é a do https://dreamcast.rs/setup.html — defina KOS_RUST_BASE se ela não está em /opt/toolchains/dc/rust." >&2
 		exit 1
 	fi
+	# O environ_base.sh lê KOS_INC_PATHS_CPP sem definir. `set -u` transforma isso em erro
+	# logo depois do GCC estar instalado.
+	set +u
 	# shellcheck disable=SC1091
 	source "$KOS_RUST_BASE/misc/environ.sh"
+	set -u
 	if ! command -v kos-cargo >/dev/null 2>&1; then
 		echo "o environ.sh não deixou o kos-cargo no PATH." >&2
 		exit 1
