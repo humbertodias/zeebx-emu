@@ -747,6 +747,15 @@ pub trait Rasterizador {
     /// [`Self::frame_rgb565`] de sempre. É o que permite ao mesmo motor servir aos dois caminhos.
     fn desenha_no_fbo(&mut self, _fbo: Option<u32>) {}
 
+    /// O contexto volta ao motor depois de a janela pintar nele. Ver
+    /// [`GpuState`](crate::video::gpu::GpuState). No software não há contexto.
+    fn retoma_o_contexto(&mut self) {}
+
+    /// O quadro acabou e o contexto volta ao frontend, que desenha o FBO na tela com ele.
+    ///
+    /// Ver [`GpuState`](crate::video::gpu::GpuState). No software não há contexto a devolver.
+    fn devolve_ao_frontend(&mut self) {}
+
     /// Se trazer o quadro para a memória da CPU custa uma **espera pela placa**.
     ///
     /// Reduz a resolução interna do 3D, desenhando numa superfície menor e ampliando na

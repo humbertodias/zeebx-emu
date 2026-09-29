@@ -2143,6 +2143,42 @@ impl Rasterizador for GpuState {
         self.fbo_externo = fbo;
     }
 
+    /// **O VAO do core não pode ficar ligado quando o frontend desenha.** O `e6a436e` parou de
+    /// desligar programa e VAO a cada lote, e no caminho do libretro o quadro acabava com os
+    /// nossos ligados. O driver `gl` do RetroArch sobre GLES não liga VAO próprio: os ponteiros de
+    /// atributo dele caíam no nosso VAO, e com VAO diferente de zero o GLES 3 recusa os vértices
+    /// que vêm da memória do processador (`GL_INVALID_OPERATION`). O desenho do FBO na tela falhava
+    /// em silêncio: tela preta, com o áudio normal, nos portáteis de GLES.
+    ///
+    /// Uma vez por quadro, e não por lote: o ganho do `e6a436e` fica.
+    /// **Quando a janela pinta no mesmo contexto, o espelho não sabe mais o que está na placa.**
+    /// O `devolve_o_contexto` registra o que ele mesmo deixa, e isso vale até o `egui` pintar: ele
+    /// troca o viewport pelo da janela, liga a tesoura e liga a mistura de alfa pré-multiplicado.
+    /// O espelho seguia com os valores de antes e não os reenviava — o Ridge Racer desenhava num
+    /// canto da janela, com o fundo das texturas branco.
+    ///
+    /// É o par do [`GpuState::desenha_no_fbo`] do libretro, e custa o mesmo: uma vez por quadro
+    /// da janela, e não por lote.
+    fn retoma_o_contexto(&mut self) {
+        if self.placa.de_outro() {
+            self.esquece_o_espelho();
+            self.placa.esquece_o_ligado();
+        }
+    }
+
+    fn devolve_ao_frontend(&mut self) {
+        if self.fbo_externo.is_none() || self.placa.morreu() {
+            return;
+        }
+        let gl = &self.gl;
+        unsafe {
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
+        self.placa.esquece_o_ligado();
+    }
+
     fn set_matrix_mode(&mut self, mode: u32) {
         self.estado.set_matrix_mode(mode);
     }
@@ -3854,6 +3890,58 @@ mod tests {
     /// (`src/ui/app.rs` entrega o contexto do `eframe` à sessão, e `src/ui/gpu.rs` o pinta). O que
     /// o `Pintor` faz no fim de cada pintura está copiado aqui: `use_program(None)` e
     /// `bind_vertex_array(None)`. O quadro dos dois lados tem de sair **igual**.
+    /// **O que a janela muda entre dois quadros volta a ser do motor.** O `egui` pinta no mesmo
+    /// contexto e deixa o viewport do tamanho da janela, a tesoura ligada e a mistura de alfa
+    /// pré-multiplicado. O espelho achava que viewport e mistura eram os do motor e não os
+    /// reenviava: o Ridge Racer saía num canto da janela, com caixas brancas no lugar da
+    /// transparência.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn o_estado_que_a_janela_deixa_nao_vaza_para_o_quadro_seguinte() {
+        use glow::HasContext as _;
+
+        let (largura, altura) = (16, 16);
+        let Some((contexto, gl)) = placa_emprestada() else {
+            return;
+        };
+        let (Some(mut referencia), Some(mut com_janela)) = (
+            estado_emprestado(largura, altura, &gl),
+            estado_emprestado(largura, altura, &gl),
+        ) else {
+            return;
+        };
+        let _ = &contexto;
+        let medida = (largura, altura);
+
+        // A referência termina **antes** de a janela pintar: o contexto é um só, e o que a janela
+        // muda valeria para as duas.
+        primeiro_lote(&mut referencia, medida);
+        segundo_lote(&mut referencia);
+        primeiro_lote(&mut com_janela, medida);
+
+        // **O `egui` pinta aqui**, e é assim que ele deixa o contexto.
+        unsafe {
+            gl.viewport(0, 0, 4, 4);
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(0, 0, 4, 4);
+            gl.enable(glow::BLEND);
+            gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE_MINUS_DST_ALPHA,
+                glow::ONE,
+            );
+        }
+        com_janela.retoma_o_contexto();
+        segundo_lote(&mut com_janela);
+
+        assert_eq!(
+            com_janela.read_rect(0, 0, largura, altura),
+            referencia.read_rect(0, 0, largura, altura),
+            "o segundo lote desenhou com o viewport, a tesoura ou a mistura que a janela deixou"
+        );
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn o_pintor_no_mesmo_contexto_nao_apaga_o_desenho_do_jogo() {
@@ -3899,6 +3987,72 @@ mod tests {
             "o segundo lote desenhou com o programa que o egui deixou: o cache dos objetos ligados \
              sobreviveu a outra pessoa usar o contexto"
         );
+    }
+
+    /// **No fim do quadro do libretro, nada do motor fica ligado.** O RetroArch desenha o FBO na
+    /// tela com o mesmo contexto, e no GLES o VAO do motor ligado derrubava esse desenho: tela
+    /// preta com áudio nos portáteis. Ver [`GpuState::devolve_ao_frontend`].
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn o_fim_do_quadro_devolve_o_contexto_sem_nada_do_motor_ligado() {
+        use glow::HasContext as _;
+
+        let (largura, altura) = (16, 16);
+        let Some((contexto, gl)) = placa_emprestada() else {
+            return;
+        };
+        let Some(mut estado) = estado_emprestado(largura, altura, &gl) else {
+            return;
+        };
+        let _ = &contexto;
+        // O FBO do "frontend", como o `get_current_framebuffer` entregaria.
+        let fbo = unsafe {
+            let textura = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_2D, Some(textura));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                largura as i32,
+                altura as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let fbo = gl.create_framebuffer().unwrap();
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(textura),
+                0,
+            );
+            fbo
+        };
+        let ligados = || unsafe {
+            [
+                gl.get_parameter_i32(glow::VERTEX_ARRAY_BINDING),
+                gl.get_parameter_i32(glow::CURRENT_PROGRAM),
+                gl.get_parameter_i32(glow::ARRAY_BUFFER_BINDING),
+            ]
+        };
+
+        estado.desenha_no_fbo(Some(fbo.0.get()));
+        primeiro_lote(&mut estado, (largura, altura));
+        assert_ne!(
+            ligados(),
+            [0, 0, 0],
+            "o teste não discrimina: depois do lote o motor deveria estar com os seus ligados"
+        );
+        estado.devolve_ao_frontend();
+        assert_eq!(ligados(), [0, 0, 0], "VAO, programa e VBO do motor ficaram ligados");
+
+        // O quadro seguinte religa o que precisa e desenha.
+        estado.desenha_no_fbo(Some(fbo.0.get()));
+        segundo_lote(&mut estado);
+        assert_ne!(ligados(), [0, 0, 0], "o quadro seguinte não religou os objetos do motor");
     }
 
     /// **A placa que morreu no meio do quadro não recebe desenho novo.**
