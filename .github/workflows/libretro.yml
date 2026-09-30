@@ -13,8 +13,8 @@
 # cross-build de `unicorn` (QEMU em C) e `dynarmic` (C++20 com CMake) exigiria toolchain e sysroot
 # que ninguém quer manter só para empacotar. O Switch é a exceção: o `.a` sai da imagem
 # `devkitpro/devkita64`, pelo `frontends/switch/compilar.sh`. O Dreamcast sai como `.klf`, a
-# biblioteca que o KallistiOS carrega em tempo de execução. Não há imagem pronta como a do
-# devkitA64: o job `core-dreamcast` monta a cadeia do dreamcast.rs no runner e chama o
+# biblioteca que o KallistiOS carrega em tempo de execução. A cadeia Rust está na imagem
+# `hldtux/dc-kos-toolchain-rs`; o job `core-dreamcast` só chama o
 # `frontends/dreamcast/compilar.sh`.
 
 name: libretro
@@ -228,64 +228,18 @@ jobs:
           name: zeebx_libretro_switch
           path: frontends/switch/saida/libzeebx_libretro.a
 
-  # Biblioteca que o KallistiOS abre com library_open. O rustc de fábrica não emite SH-4:
-  # a cadeia é a do dreamcast.rs (GCC sh-elf + rustc_codegen_gcc), e o compilar.sh liga o .klf.
+  # Biblioteca que o KallistiOS abre com library_open. A imagem traz o GCC com libgccjit
+  # e o rustc_codegen_gcc; o runner só compila o .klf. Ela é Alpine, então o job não entra
+  # nela: as actions de checkout e upload precisam do Node do Ubuntu.
   dreamcast:
     name: core-dreamcast
     runs-on: ubuntu-24.04
-    # A primeira vez compila o GCC do SH-4 e o sysroot do Rust. As seguintes usam o cache.
-    timeout-minutes: 360
+    timeout-minutes: 180
     steps:
-      - name: Dependências da cadeia
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential bison bzip2 cmake curl diffutils flex gawk git \
-            libelf-dev libgmp-dev libisofs-dev libjpeg-dev libmpc-dev libmpfr-dev \
-            libpng-dev meson ninja-build patch pkg-config python3 tar texinfo \
-            wget gettext
-
       - uses: actions/checkout@v7
 
-      # O cache grava em /opt, que o runner não deixa escrever até este chown.
-      - name: Diretório da cadeia
-        run: |
-          sudo mkdir -p /opt/toolchains/dc
-          sudo chown -R "$USER" /opt/toolchains/dc
-
-      - uses: actions/cache@v4
-        id: cadeia
-        with:
-          path: /opt/toolchains/dc/rust
-          key: libretro-dreamcast-toolchain-v1
-          # O GCC leva horas. Se um passo seguinte falha, o que já compilou fica no cache.
-          save-always: true
-
-      - name: Instala a cadeia
-        run: |
-          set -eo pipefail
-          if [[ ! -d /opt/toolchains/dc/rust/misc ]]; then
-            git clone --depth 1 https://github.com/dreamcast-rs/rust-for-dreamcast.git /opt/toolchains/dc/rust
-          fi
-          if [[ ! -d /opt/toolchains/dc/rust/kos/utils ]]; then
-            git clone --depth 1 https://github.com/dreamcast-rs/KallistiOS.git /opt/toolchains/dc/rust/kos
-          fi
-          if [[ ! -x /opt/toolchains/dc/rust/sh-elf/bin/sh-elf-gcc ]]; then
-            # -j2: o runner tem pouca RAM para um GCC inteiro em todos os núcleos ao mesmo tempo.
-            /opt/toolchains/dc/rust/misc/install-toolchain.sh -j2
-          fi
-          # O environ_base.sh lê KOS_INC_PATHS_CPP sem definir. Com `set -u` isso é erro,
-          # e foi o que derrubou o job depois do "sh-elf toolchain installed!".
-          set +u
-          # shellcheck disable=SC1091
-          source /opt/toolchains/dc/rust/misc/environ.sh
-          make -C "$KOS_BASE" -j2
-          if [[ ! -x ${KOS_RCG_BASE}/build_system/target/release/y ]]; then
-            /opt/toolchains/dc/rust/misc/install-rust.sh
-          fi
-
       - name: Compila a biblioteca
-        run: ./frontends/dreamcast/compilar.sh --local
+        run: ./frontends/dreamcast/compilar.sh
 
       - uses: actions/upload-artifact@v7
         with:

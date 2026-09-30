@@ -13,18 +13,17 @@
 # o rustc, o GCC gera SH-4, e o cabeçalho de cada objeto ainda diz MIPS até este
 # script reescrever e_machine. Sem isso o `sh-elf-ld` recusa o objeto.
 #
-# A cadeia já no ambiente (source de $KOS_RUST_BASE/misc/environ.sh):
+# No host, a cadeia está na imagem hldtux/dc-kos-toolchain-rs (GCC com libgccjit e
+# rustc_codegen_gcc). O repositório dela só publica a tag `latest`.
 #   ./frontends/dreamcast/compilar.sh
 #
-# Dentro dessa cadeia, com o ambiente já exportado:
+# Dentro dessa imagem, com o ambiente já exportado:
 #   ./frontends/dreamcast/compilar.sh --local [diretorio-de-saida]
-#
-# Uma imagem que já traz a cadeia:
-#   ZEEBX_DREAMCAST_IMAGE=nome ./frontends/dreamcast/compilar.sh
 set -euo pipefail
 
 AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RAIZ="$(cd "$AQUI/../.." && pwd)"
+IMAGEM="${ZEEBX_DREAMCAST_IMAGE:-hldtux/dc-kos-toolchain-rs:latest}"
 KOS_RUST_BASE="${KOS_RUST_BASE:-/opt/toolchains/dc/rust}"
 
 # O rustc_codegen_gcc não faz LTO, e o perfil release do workspace pede thin LTO.
@@ -44,6 +43,12 @@ preparar_ambiente() {
 	# shellcheck disable=SC1091
 	source "$KOS_RUST_BASE/misc/environ.sh"
 	set -u
+	# O rustc_codegen_gcc abre libgccjit.so ao compilar. O environ.sh não põe esse
+	# diretório no LD_LIBRARY_PATH; o entrypoint da imagem faz isso, e um shell que
+	# não passou por ele precisa da mesma linha.
+	if [[ -n "${KOS_CC_BASE:-}" ]]; then
+		export LD_LIBRARY_PATH="${KOS_CC_BASE}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+	fi
 	if ! command -v kos-cargo >/dev/null 2>&1; then
 		echo "o environ.sh não deixou o kos-cargo no PATH." >&2
 		exit 1
@@ -189,24 +194,23 @@ if [[ "${1:-}" == "--local" ]]; then
 	exit 0
 fi
 
-if [[ -n "${ZEEBX_DREAMCAST_IMAGE:-}" ]]; then
-	SAIDA="${1:-$AQUI/saida}"
-	mkdir -p "$SAIDA"
-	docker run --rm --platform linux/amd64 \
-		-u "$(id -u):$(id -g)" \
-		-e HOME=/tmp \
-		-v "$RAIZ:/src" \
-		-w /src \
-		"$ZEEBX_DREAMCAST_IMAGE" \
-		bash -lc "set -euo pipefail
+SAIDA="${1:-$AQUI/saida}"
+mkdir -p "$SAIDA"
+# A imagem espera root: o rustup em /opt/rustup não é gravável por outro usuário.
+# O chown devolve o .klf e o target a quem chamou.
+docker run --rm --platform linux/amd64 \
+	-e HOME=/tmp \
+	-v "$RAIZ:/src" \
+	-w /src \
+	"$IMAGEM" \
+	bash -lc "set -euo pipefail
 cd /src
+# Também numa falha: senão o target fica do root e o host não apaga.
+trap 'chown -R $(id -u):$(id -g) /src/frontends/dreamcast/saida /src/Cargo.lock || true
+if [[ -d /src/target ]]; then chown -R $(id -u):$(id -g) /src/target || true; fi' EXIT
 ./frontends/dreamcast/compilar.sh --local /src/frontends/dreamcast/saida
 "
-	if [[ "$SAIDA" != "$AQUI/saida" ]]; then
-		cp -f "$AQUI/saida/zeebx_libretro.klf" "$SAIDA/"
-		echo "built: $SAIDA/zeebx_libretro.klf"
-	fi
-	exit 0
+if [[ "$SAIDA" != "$AQUI/saida" ]]; then
+	cp -f "$AQUI/saida/zeebx_libretro.klf" "$SAIDA/"
+	echo "built: $SAIDA/zeebx_libretro.klf"
 fi
-
-compilar_local "$@"
