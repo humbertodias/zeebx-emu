@@ -30,8 +30,8 @@ type ContextoProprio = Contexto;
 type ContextoProprio = ();
 use super::gles;
 use super::rasterizer::{
-    GlState, Matrix, QuadroNaPlaca, Rasterizador, TexEnv, Texture as TexturaSalva,
-    UnidadeDeTextura, Vertex,
+    GlState, Matrix, linhas_em_triangulos, QuadroNaPlaca, Rasterizador, TexEnv, Texture as TexturaSalva,
+    UnidadeDeTextura, UV_PADRAO, Vertex,
 };
 use glow::{self, HasContext};
 use std::collections::HashMap;
@@ -1760,9 +1760,9 @@ fn uniforme_vec3(
 fn poe_em(destino: &mut Vec<f32>, v: &Vertex) {
     destino.extend_from_slice(&v.position);
     destino.extend_from_slice(&v.color);
-    destino.extend_from_slice(&v.uv);
+    destino.extend_from_slice(&v.uv[..2]);
     destino.push(v.fog);
-    destino.extend_from_slice(&v.uv1);
+    destino.extend_from_slice(&v.uv1[..2]);
 }
 
 /// Os bytes de um vetor de `f32`, para o `buffer_data`.
@@ -2182,6 +2182,9 @@ impl Rasterizador for GpuState {
     fn set_matrix_mode(&mut self, mode: u32) {
         self.estado.set_matrix_mode(mode);
     }
+    fn matriz_do_topo(&self) -> Matrix {
+        self.estado.matriz_do_topo()
+    }
     fn load_identity(&mut self) {
         self.estado.load_identity();
     }
@@ -2549,12 +2552,17 @@ impl Rasterizador for GpuState {
     }
 
     fn draw(&mut self, mode: u32, vertices: &[Vertex]) {
-        // Pontos e linhas não aparecem nos jogos do console, e o rasterizador de software também
-        // os deixa sem tratamento. Desenhá-los aqui divergiria dele sem ganho nenhum.
+        // Linhas viram triângulos soltos pela mesma conta do rasterizador de software — ver
+        // [`linhas_em_triangulos`]. Pontos continuam sem tratamento, lá e aqui.
+        let linhas = matches!(
+            mode,
+            gles::GL_LINES | gles::GL_LINE_STRIP | gles::GL_LINE_LOOP
+        );
         let modo = match mode {
             gles::GL_TRIANGLES => glow::TRIANGLES,
             gles::GL_TRIANGLE_STRIP => glow::TRIANGLE_STRIP,
             gles::GL_TRIANGLE_FAN => glow::TRIANGLE_FAN,
+            _ if linhas => glow::TRIANGLES,
             _ => return,
         };
         self.estado.etapa_de_vertice(vertices);
@@ -2582,7 +2590,16 @@ impl Rasterizador for GpuState {
         }
         let mut soltos = std::mem::take(&mut self.soltos);
         soltos.clear();
-        soltos.extend(self.estado.transformados().iter().map(|v| {
+        let de_linhas = linhas.then(|| {
+            linhas_em_triangulos(
+                mode,
+                self.estado.transformados(),
+                self.estado.viewport,
+                self.estado.front_face != gles::GL_CW,
+            )
+        });
+        let origem = de_linhas.as_deref().unwrap_or(self.estado.transformados());
+        soltos.extend(origem.iter().map(|v| {
             let [px, py, pz, pw] = v.position;
             Vertex {
                 position: [px * k, py, pz, pw],
@@ -2651,7 +2668,7 @@ impl Rasterizador for GpuState {
         for ([sx, sy], uv) in cantos {
             let v = Vertex {
                 normal: [0.0, 0.0, 1.0],
-                uv1: [0.0; 2],
+                uv1: UV_PADRAO,
                 fog: 1.0,
                 position: [
                     ((sx - vx as f32) / vw as f32) * 2.0 - 1.0,
@@ -2660,7 +2677,7 @@ impl Rasterizador for GpuState {
                     1.0,
                 ],
                 color: cor,
-                uv,
+                uv: [uv[0], uv[1], 0.0, 1.0],
             };
             self.poe(&v);
         }
@@ -2928,9 +2945,9 @@ impl Rasterizador for GpuState {
             self.poe(&Vertex {
                 position: [px, py, 0.0, 1.0],
                 color: [1.0; 4],
-                uv,
+                uv: [uv[0], uv[1], 0.0, 1.0],
                 normal: [0.0, 0.0, 1.0],
-                uv1: [0.0; 2],
+                uv1: UV_PADRAO,
                 fog: 1.0,
             });
         }
@@ -3214,8 +3231,8 @@ mod tests {
             let canto = |x: f32, y: f32| Vertex {
                 position: [x, y, 0.0, 1.0],
                 color: [1.0, 0.0, 0.0, 1.0],
-                uv: [0.0, 0.0],
-                uv1: [0.0; 2],
+                uv: UV_PADRAO,
+                uv1: UV_PADRAO,
                 normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
             };
@@ -3264,8 +3281,8 @@ mod tests {
             let canto = |x: f32, y: f32| Vertex {
                 position: [x, y, 0.0, 1.0],
                 color: [1.0, 0.0, 0.0, 1.0],
-                uv: [0.0, 0.0],
-                uv1: [0.0; 2],
+                uv: UV_PADRAO,
+                uv1: UV_PADRAO,
                 normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
             };
@@ -3337,8 +3354,8 @@ mod tests {
             let canto = |x: f32, y: f32| Vertex {
                 position: [x, y, 0.0, 1.0],
                 color: [1.0, 0.0, 0.0, 1.0],
-                uv: [0.0, 0.0],
-                uv1: [0.0; 2],
+                uv: UV_PADRAO,
+                uv1: UV_PADRAO,
                 normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
             };
@@ -3405,8 +3422,8 @@ mod tests {
             let canto = |x: f32, y: f32| Vertex {
                 position: [x, y, 0.0, 1.0],
                 color: [1.0, 0.0, 0.0, 1.0],
-                uv: [0.0, 0.0],
-                uv1: [0.0; 2],
+                uv: UV_PADRAO,
+                uv1: UV_PADRAO,
                 normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
             };
@@ -3454,8 +3471,8 @@ mod tests {
         let canto = |x: f32, y: f32| Vertex {
             position: [x, y, 0.0, 1.0],
             color: [1.0, 0.0, 0.0, 1.0],
-            uv: [0.0, 0.0],
-            uv1: [0.0; 2],
+            uv: UV_PADRAO,
+            uv1: UV_PADRAO,
             normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
         };
@@ -3523,8 +3540,8 @@ mod tests {
         let canto = |x: f32, y: f32| Vertex {
             position: [x, y, -1.0, 1.0],
             color: [0.0, 1.0, 0.0, 1.0],
-            uv: [0.0, 0.0],
-            uv1: [0.0; 2],
+            uv: UV_PADRAO,
+            uv1: UV_PADRAO,
             normal: [0.0, 0.0, 1.0],
             fog: 1.0,
         };
@@ -3565,8 +3582,8 @@ mod tests {
             let canto = |x: f32, y: f32| Vertex {
                 position: [x, y, 0.0, 1.0],
                 color: [0.0, 1.0, 0.0, 1.0],
-                uv: [0.0, 0.0],
-                uv1: [0.0; 2],
+                uv: UV_PADRAO,
+                uv1: UV_PADRAO,
                 normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
             };
@@ -3610,8 +3627,8 @@ mod tests {
             let canto = |x: f32, y: f32| Vertex {
                 position: [x, y, 1.5, 1.0],
                 color: [0.0, 0.0, 1.0, 1.0],
-                uv: [0.0, 0.0],
-                uv1: [0.0; 2],
+                uv: UV_PADRAO,
+                uv1: UV_PADRAO,
                 normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
             };
@@ -3660,8 +3677,8 @@ mod tests {
                     let canto = |x: f32, y: f32| Vertex {
                         position: [x, y, 0.0, 1.0],
                         color: [1.0, 1.0, 1.0, 1.0],
-                        uv: [0.0, 0.0],
-                        uv1: [0.0; 2],
+                        uv: UV_PADRAO,
+                        uv1: UV_PADRAO,
                         normal: [0.0, 0.0, 1.0],
                 fog: 1.0,
                     };
@@ -3856,8 +3873,8 @@ mod tests {
         let vertice = |(x, y): (f32, f32)| Vertex {
             position: [x, y, 0.0, 1.0],
             color: cor,
-            uv: [0.0, 0.0],
-            uv1: [0.0; 2],
+            uv: UV_PADRAO,
+            uv1: UV_PADRAO,
             normal: [0.0, 0.0, 1.0],
             fog: 1.0,
         };
