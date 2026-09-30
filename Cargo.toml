@@ -131,7 +131,9 @@ zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 # (medido: pico 0,000 no relatório da varredura). É o mesmo decodificador, com duas caixas a mais.
 symphonia = { version = "0.5.5", default-features = false, features = ["mp1", "mp2", "mp3", "ogg", "vorbis"] }
 discord-rich-presence = { version = "1.1", optional = true }
-sevenz-rust2 = "0.23.0"
+# O rustc do Dreamcast é o nightly 1.91 (dreamcast.rs, 2025-08-14). A 0.21 subiu
+# o MSRV para 1.93 por causa do `nt-time` 0.15. A 0.20.2 ainda declara rust-version 1.85.
+sevenz-rust2 = "=0.20.2"
 # Síntese por banco de amostras, ver a feature `soundfont`. MIT e Rust puro: nada de C, nada de
 # biblioteca de host, e por isso pode entrar no core Libretro.
 rustysynth = { version = "1.3.6", optional = true }
