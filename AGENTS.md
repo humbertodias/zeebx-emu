@@ -97,7 +97,8 @@ release faz o mesmo e publica `zeebx_libretro-switch.zip`. O `.a` não liga sozi
 é o interpretador, não o Dynarmic. O `cfg(zeebx_wii)` encolhe o heap e o cache de som e não
 pede contexto de OpenGL — o vídeo de lá é GX. No Mac o script sobe a imagem
 `reallibretroretroarch/libretro-build-devkitpro` (a mesma do CI de Wii do RetroArch) e instala
-o rustc nela; o job `core-wii` do `libretro.yml` roda `--local` dentro dessa imagem.
+o rustc nela. O job `core-wii` chama esse script no runner: o glibc da imagem é anterior ao
+2.25, e o Node 24 do `actions/checkout` não liga lá dentro.
 A release publica `zeebx_libretro-wii.zip`. Quem monta o DOL copia o arquivo para `libretro_wii.a`.
 
 **iOS** precisa de um Mac com Xcode e dos alvos `aarch64-apple-ios` e

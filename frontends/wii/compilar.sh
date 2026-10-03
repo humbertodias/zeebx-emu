@@ -9,8 +9,11 @@
 # No Mac, a cadeia está na imagem do CI de Wii do RetroArch (o script instala o rustc lá dentro):
 #   ./frontends/wii/compilar.sh
 #
-# Dentro dessa cadeia (o job do libretro.yml usa a mesma imagem):
+# Dentro dessa cadeia:
 #   ./frontends/wii/compilar.sh --local [diretorio-de-saida]
+#
+# O job do CI chama o script sem --local. Declarar a imagem como `container:` do
+# Actions faz o checkout rodar lá dentro, e o glibc dela é anterior ao 2.25.
 set -euo pipefail
 
 AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,20 +118,30 @@ fi
 SAIDA="${1:-$AQUI/saida}"
 mkdir -p "$SAIDA"
 
-docker run --rm --platform linux/amd64 \
-	-v "$RAIZ:/src" \
-	-w /src \
+# Esses dois diretórios, se o CI os definir, sobrevivem ao --rm. Sem eles o
+# rustup fica em /root e some com o contêiner.
+docker_args=(--rm --platform linux/amd64 -v "$RAIZ:/src" -w /src)
+if [[ -n "${ZEEBX_WII_CARGO_HOME:-}" ]]; then
+	mkdir -p "$ZEEBX_WII_CARGO_HOME"
+	docker_args+=(-v "$ZEEBX_WII_CARGO_HOME:/usr/local/cargo" -e CARGO_HOME=/usr/local/cargo)
+fi
+if [[ -n "${ZEEBX_WII_RUSTUP_HOME:-}" ]]; then
+	mkdir -p "$ZEEBX_WII_RUSTUP_HOME"
+	docker_args+=(-v "$ZEEBX_WII_RUSTUP_HOME:/usr/local/rustup" -e RUSTUP_HOME=/usr/local/rustup)
+fi
+
+docker run "${docker_args[@]}" \
 	"$IMAGEM" \
 	bash -lc "set -euo pipefail
 export DEVKITPRO=/opt/devkitpro
 export DEVKITPPC=/opt/devkitpro/devkitPPC
-export PATH=\"/opt/devkitpro/devkitPPC/bin:\$PATH\"
+export PATH=\"\${CARGO_HOME:-\$HOME/.cargo}/bin:/opt/devkitpro/devkitPPC/bin:\$PATH\"
 if ! command -v rustc >/dev/null 2>&1 || ! [[ -d \"\$(rustc --print sysroot)/lib/rustlib/src/rust/library/std\" ]]; then
   apt-get update
   apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config
   curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --component rust-src
 fi
-. \"\$HOME/.cargo/env\"
+. \"\${CARGO_HOME:-\$HOME/.cargo}/env\"
 cd /src
 ./frontends/wii/compilar.sh --local /src/frontends/wii/saida
 "

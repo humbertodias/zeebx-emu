@@ -608,45 +608,53 @@ jobs:
           path: zeebx_libretro-switch.zip
           if-no-files-found: error
 
-  # O devkitPPC não está no runner: o job roda na imagem do CI de Wii do RetroArch, como o
-  # `core-wii` do `libretro.yml`. O `.a` vira `libretro_wii.a` na raiz do RetroArch.
+  # A compilação entra em reallibretroretroarch/libretro-build-devkitpro, como o
+  # `core-wii` do `libretro.yml`. O job em si fica no runner: o glibc dessa imagem é
+  # anterior ao 2.25 e o Node 24 do checkout não liga. O `.a` vira `libretro_wii.a`
+  # na raiz do RetroArch.
   wii:
     name: core-wii
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    container:
-      image: reallibretroretroarch/libretro-build-devkitpro:latest
-      options: --user root
     steps:
-      - name: Git
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            ca-certificates curl git pkg-config python3 zip
-
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
         with:
-          components: rust-src
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: core-wii
+          path: |
+            ~/.cache/zeebx-wii/cargo
+            ~/.cache/zeebx-wii/rustup
+            target
+          key: core-wii-${{ hashFiles('Cargo.lock') }}
+          restore-keys: core-wii-
 
       - name: Compila o staticlib
-        run: ./frontends/wii/compilar.sh --local
+        run: |
+          export ZEEBX_WII_CARGO_HOME="$HOME/.cache/zeebx-wii/cargo"
+          export ZEEBX_WII_RUSTUP_HOME="$HOME/.cache/zeebx-wii/rustup"
+          ./frontends/wii/compilar.sh
+          # O contêiner roda como root. Sem isto o zip das licenças e o cache não leem a saída.
+          sudo chown -R "$(id -u):$(id -g)" \
+            frontends/wii/saida target \
+            "$ZEEBX_WII_CARGO_HOME" "$ZEEBX_WII_RUSTUP_HOME"
 
       - name: O arquivo é PowerPC
         run: |
-          tmp=$(mktemp -d)
-          ( cd "$tmp" && ar x "$GITHUB_WORKSPACE/frontends/wii/saida/libzeebx_libretro_wii.a" )
-          ruim=$(powerpc-eabi-objdump -f "$tmp"/*.o | grep 'file format' | grep -v elf32-powerpc || true)
-          if [ -n "$ruim" ]; then
-            echo "o .a misturou objeto que não é PowerPC"
-            echo "$ruim"
-            exit 1
-          fi
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            reallibretroretroarch/libretro-build-devkitpro:latest \
+            bash -lc '
+              set -euo pipefail
+              export PATH="/opt/devkitpro/devkitPPC/bin:$PATH"
+              tmp=$(mktemp -d)
+              ( cd "$tmp" && powerpc-eabi-ar x /src/frontends/wii/saida/libzeebx_libretro_wii.a )
+              ruim=$(powerpc-eabi-objdump -f "$tmp"/*.o | grep "file format" | grep -v elf32-powerpc || true)
+              if [ -n "$ruim" ]; then
+                echo "o .a misturou objeto que não é PowerPC"
+                echo "$ruim"
+                exit 1
+              fi
+            '
 
       - name: Empacota o core
         run: |
