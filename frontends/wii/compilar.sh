@@ -6,7 +6,7 @@
 # .a estático. Na hora de montar o DOL, copie este arquivo para libretro_wii.a na
 # raiz do RetroArch e rode `make -f Makefile.griffin platform=wii`.
 #
-# No Mac, a cadeia está na imagem devkitpro/devkitppc (o script instala o rustc lá dentro):
+# No Mac, a cadeia está na imagem do CI de Wii do RetroArch (o script instala o rustc lá dentro):
 #   ./frontends/wii/compilar.sh
 #
 # Dentro dessa cadeia (o job do libretro.yml usa a mesma imagem):
@@ -15,7 +15,7 @@ set -euo pipefail
 
 AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RAIZ="$(cd "$AQUI/../.." && pwd)"
-IMAGEM="${ZEEBX_WII_IMAGE:-devkitpro/devkitppc:20260503}"
+IMAGEM="${ZEEBX_WII_IMAGE:-reallibretroretroarch/libretro-build-devkitpro:latest}"
 PPC_BIN="/opt/devkitpro/devkitPPC/bin"
 
 compilar_local() {

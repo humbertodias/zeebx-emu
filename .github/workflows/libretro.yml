@@ -11,9 +11,9 @@
 #
 # Cada alvo roda no seu próprio runner: AArch64 Linux e Windows em runner ARM64 nativo, porque
 # cross-build de `unicorn` (QEMU em C) e `dynarmic` (C++20 com CMake) exigiria toolchain e sysroot
-# que ninguém quer manter só para empacotar. Duas exceções saem de imagem do devkitPro: o Switch,
-# `devkitpro/devkita64` pelo `frontends/switch/compilar.sh`, e o Wii, `devkitpro/devkitppc` pelo
-# `frontends/wii/compilar.sh`.
+# que ninguém quer manter só para empacotar. Duas exceções saem de imagem: o Switch,
+# `devkitpro/devkita64` pelo `frontends/switch/compilar.sh`, e o Wii,
+# `reallibretroretroarch/libretro-build-devkitpro` pelo `frontends/wii/compilar.sh`.
 
 name: libretro
 
@@ -234,8 +234,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
-      # Tag datada, não `latest`: a imagem nova entra quando alguém muda esta linha.
-      # A mesma tag está no default de `frontends/wii/compilar.sh`.
+      # A mesma imagem do CI de Wii do RetroArch, e o default de `frontends/wii/compilar.sh`.
+      # `latest` de propósito: é a cadeia com que o frontend de Wii é montado.
       image: reallibretroretroarch/libretro-build-devkitpro:latest
       options: --user root
     steps:

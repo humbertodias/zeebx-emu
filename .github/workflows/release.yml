@@ -608,14 +608,15 @@ jobs:
           path: zeebx_libretro-switch.zip
           if-no-files-found: error
 
-  # O devkitPPC não está no runner: o job roda na imagem do devkitPro, como o `core-wii` do
-  # `libretro.yml`. O `.a` vira `libretro_wii.a` na raiz do RetroArch antes do `Makefile.griffin`.
+  # O devkitPPC não está no runner: o job roda na imagem do CI de Wii do RetroArch, como o
+  # `core-wii` do `libretro.yml`. O `.a` vira `libretro_wii.a` na raiz do RetroArch.
   wii:
     name: core-wii
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
-      image: devkitpro/devkitppc:20260503
+      image: reallibretroretroarch/libretro-build-devkitpro:latest
+      options: --user root
     steps:
       - name: Git
         run: |

@@ -95,8 +95,9 @@ release faz o mesmo e publica `zeebx_libretro-switch.zip`. O `.a` não liga sozi
 **Wii** (o `.a` estático que o RetroArch liga no DOL) mora em
 [`frontends/wii/compilar.sh`](frontends/wii/compilar.sh). O Broadway é PowerPC, então o núcleo
 é o interpretador, não o Dynarmic. O `cfg(zeebx_wii)` encolhe o heap e o cache de som e não
-pede contexto de OpenGL — o vídeo de lá é GX. No Mac o script sobe a imagem `devkitpro/devkitppc`
-e instala o rustc nela; o job `core-wii` do `libretro.yml` roda `--local` dentro dessa imagem.
+pede contexto de OpenGL — o vídeo de lá é GX. No Mac o script sobe a imagem
+`reallibretroretroarch/libretro-build-devkitpro` (a mesma do CI de Wii do RetroArch) e instala
+o rustc nela; o job `core-wii` do `libretro.yml` roda `--local` dentro dessa imagem.
 A release publica `zeebx_libretro-wii.zip`. Quem monta o DOL copia o arquivo para `libretro_wii.a`.
 
 **iOS** precisa de um Mac com Xcode e dos alvos `aarch64-apple-ios` e
