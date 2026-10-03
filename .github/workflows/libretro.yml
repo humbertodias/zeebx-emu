@@ -241,7 +241,6 @@ jobs:
     steps:
       - name: Git
         run: |
-          apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl git pkg-config python3
 
