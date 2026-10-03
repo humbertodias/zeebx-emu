@@ -51,6 +51,12 @@ pub const MODULE_BSS_SLACK: usize = 1024 * 1024;
 /// alvo. O que ficou dessa medição é a contabilidade honesta de "quanto há livre": ver
 /// [`crate::brew::heap::Heap::maior_bloco`].
 pub const HEAP_BASE: u32 = 0x1000_0000;
+/// No Wii o heap de 64 MB não cabe: o MEM2 tem 64 MB e o RetroArch divide isso com o core.
+/// 16 MB é teto para a alocação existir. Não medi um jogo no console para escolher o número —
+/// o Quake, que recusa heap pequeno, pode não passar daqui.
+#[cfg(zeebx_wii)]
+pub const HEAP_SIZE: usize = 16 * 1024 * 1024;
+#[cfg(not(zeebx_wii))]
 pub const HEAP_SIZE: usize = 64 * 1024 * 1024;
 /// Pilha. `sp` começa no topo porque a pilha do ARM cresce para baixo.
 pub const STACK_BASE: u32 = 0x2000_0000;

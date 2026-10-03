@@ -2123,7 +2123,18 @@ fn retira_callback_de_audio() {
 /// sintetizador MIDI, e a releitura a quente, para o resto — e as duas tinham a mesma
 /// comparação escrita de novo. Duas cópias divergem com o tempo; uma função não.
 fn perfil_e_portatil(texto: Option<&str>) -> bool {
-    texto.is_some_and(|texto| texto.trim().eq_ignore_ascii_case("portatil"))
+    // Sem placa e com o MEM2 dividido com o RetroArch, o perfil de desktop pede resolução
+    // cheia e cache de som que não cabem. Não medi isto no console: é o perfil que o core
+    // já usa nos portáteis fracos.
+    #[cfg(zeebx_wii)]
+    {
+        let _ = texto;
+        return true;
+    }
+    #[cfg(not(zeebx_wii))]
+    {
+        texto.is_some_and(|texto| texto.trim().eq_ignore_ascii_case("portatil"))
+    }
 }
 
 /// Lê um interruptor. A convenção de valor é `enabled`/`disabled`, que é a do ecossistema.
@@ -2258,7 +2269,11 @@ fn aplica_opcoes_quentes(estado: &mut Core) {
     {
         zeebx::audio::soundfont::define_efeitos(efeitos);
     }
-    let mib = if perfil_portatil {
+    let mib = if cfg!(zeebx_wii) {
+        // O perfil Portátil pede 8 MB. No Wii o teto do motor já nasce em 4, e subir aqui
+        // faria a opção desfazer o que `media.rs` limitou por causa do MEM2.
+        Some(4)
+    } else if perfil_portatil {
         Some(8)
     } else {
         unsafe { le_opcao(c"zeebx_cache_de_som_mb") }
@@ -2618,8 +2633,15 @@ unsafe fn carrega(
     // dispara, porque do ponto de vista do core nada falhou. Sem a opção, o único remédio é trocar
     // o frontend ou o aparelho.
     let rasterizador = unsafe { le_opcao(c"zeebx_rasterizador") }.unwrap_or_default();
-    if rasterizador.trim().eq_ignore_ascii_case("software") {
-        log("Zeebx: rasterizador fixado no processador pela opção do core; nenhum contexto de placa será pedido");
+    // O vídeo do RetroArch no Wii é GX. Pedir OpenGL ou o frontend recusa, ou aceita um
+    // contexto que o glow não consegue usar — e o quadro sai preto com o core achando que
+    // a placa respondeu.
+    if cfg!(zeebx_wii) || rasterizador.trim().eq_ignore_ascii_case("software") {
+        if cfg!(zeebx_wii) {
+            log("Zeebx: Wii desenha pelo processador; nenhum contexto de placa será pedido");
+        } else {
+            log("Zeebx: rasterizador fixado no processador pela opção do core; nenhum contexto de placa será pedido");
+        }
     } else {
         pede_o_contexto_de_placa();
     }

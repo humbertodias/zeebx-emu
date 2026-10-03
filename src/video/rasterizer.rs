@@ -2737,17 +2737,28 @@ const PARALLEL_COST: usize = 64_000;
 ///
 /// O preparo por faixa existe e cresce quando ela afina — é por isso que há um piso —, mas até
 /// oito linhas ele continua menor que o trabalho que a faixa ganha.
+#[cfg(not(zeebx_wii))]
 const MIN_BAND_ROWS: usize = 8;
 
 /// Em quantas faixas horizontais dividir um quadro de `height` linhas.
 fn bands(height: usize) -> usize {
-    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let cores = *CORES.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    });
-    cores.min(height / MIN_BAND_ROWS).max(1)
+    // O Broadway é um núcleo. Se `available_parallelism` no newlib devolver mais que um,
+    // o `flush` cai em `thread::scope` e o quadro passa a depender de pthread.
+    #[cfg(zeebx_wii)]
+    {
+        let _ = height;
+        return 1;
+    }
+    #[cfg(not(zeebx_wii))]
+    {
+        static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let cores = *CORES.get_or_init(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+        cores.min(height / MIN_BAND_ROWS).max(1)
+    }
 }
 
 /// Um triângulo já projetado na tela, com tudo que não depende do pixel resolvido.

@@ -1,0 +1,35 @@
+{
+  "arch": "powerpc",
+  "cpu": "750",
+  "crt-objects-fallback": "false",
+  "data-layout": "E-m:e-p:32:32-Fn32-i64:64-n32",
+  "dynamic-linking": false,
+  "env": "gnu",
+  "features": "-altivec,-vsx",
+  "has-rpath": false,
+  "has-thread-local": true,
+  "linker": "powerpc-eabi-gcc",
+  "linker-flavor": "gnu-cc",
+  "llvm-target": "powerpc-unknown-eabi",
+  "max-atomic-width": 64,
+  "os": "linux",
+  "panic-strategy": "abort",
+  "position-independent-executables": false,
+  "pre-link-args": {
+    "gnu-cc": [
+      "-mrvl",
+      "-mcpu=750",
+      "-meabi",
+      "-mhard-float",
+      "-mno-altivec"
+    ]
+  },
+  "relro-level": "off",
+  "relocation-model": "static",
+  "target-endian": "big",
+  "target-family": [
+    "unix"
+  ],
+  "target-pointer-width": 32,
+  "vendor": "unknown"
+}

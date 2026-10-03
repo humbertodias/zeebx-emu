@@ -92,6 +92,13 @@ Mac a imagem Docker `rombundler-switch` traz o devkitA64 e o rustc; o job `core-
 release faz o mesmo e publica `zeebx_libretro-switch.zip`. O `.a` não liga sozinho: os
 `switch_jit_*` e `switch_spinlock_*` que o patch do dynarmic chama vêm do ROMBundler.
 
+**Wii** (o `.a` estático que o RetroArch liga no DOL) mora em
+[`frontends/wii/compilar.sh`](frontends/wii/compilar.sh). O Broadway é PowerPC, então o núcleo
+é o interpretador, não o Dynarmic. O `cfg(zeebx_wii)` encolhe o heap e o cache de som e não
+pede contexto de OpenGL — o vídeo de lá é GX. No Mac o script sobe a imagem `devkitpro/devkitppc`
+e instala o rustc nela; o job `core-wii` do `libretro.yml` roda `--local` dentro dessa imagem.
+A release publica `zeebx_libretro-wii.zip`. Quem monta o DOL copia o arquivo para `libretro_wii.a`.
+
 **iOS** precisa de um Mac com Xcode e dos alvos `aarch64-apple-ios` e
 `aarch64-apple-ios-sim` no rustup. O passo a passo está em
 [`frontends/ios/LEIAME.md`](frontends/ios/LEIAME.md):

@@ -6,4 +6,5 @@ fn main() {
     // O `frontends/switch/compilar.sh` passa `--cfg zeebx_switch`. Sem este aviso o rustc
     // trata o nome como desconhecido.
     println!("cargo::rustc-check-cfg=cfg(zeebx_switch)");
+    println!("cargo::rustc-check-cfg=cfg(zeebx_wii)");
 }

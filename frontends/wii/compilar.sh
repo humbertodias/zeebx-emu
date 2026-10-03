@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Monta libzeebx_libretro_wii.a para o RetroArch do Wii.
+#
+# O console é PowerPC 750 big-endian (EABI). O Dynarmic não emite esse código, então
+# o núcleo aqui é o interpretador. O RetroArch do Wii não carrega .so: ele liga um
+# .a estático. Na hora de montar o DOL, copie este arquivo para libretro_wii.a na
+# raiz do RetroArch e rode `make -f Makefile.griffin platform=wii`.
+#
+# No Mac, a cadeia está na imagem devkitpro/devkitppc (o script instala o rustc lá dentro):
+#   ./frontends/wii/compilar.sh
+#
+# Dentro dessa cadeia (o job do libretro.yml usa a mesma imagem):
+#   ./frontends/wii/compilar.sh --local [diretorio-de-saida]
+set -euo pipefail
+
+AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAIZ="$(cd "$AQUI/../.." && pwd)"
+IMAGEM="${ZEEBX_WII_IMAGE:-devkitpro/devkitppc:20260503}"
+PPC_BIN="/opt/devkitpro/devkitPPC/bin"
+
+compilar_local() {
+	local saida="${1:-$AQUI/saida}"
+	export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+	export DEVKITPPC="${DEVKITPPC:-/opt/devkitpro/devkitPPC}"
+	export PATH="${PPC_BIN}:${PATH}"
+
+	if [[ ! -x "${PPC_BIN}/powerpc-eabi-gcc" ]]; then
+		echo "não achei o powerpc-eabi-gcc. Rode dentro da imagem devkitPPC, ou sem --local para o script subir o Docker." >&2
+		exit 1
+	fi
+	if [[ ! -d "$(rustc --print sysroot)/lib/rustlib/src/rust/library/std" ]]; then
+		echo "precisa do componente rust-src: a std é recompilada para o EABI do Wii." >&2
+		exit 1
+	fi
+
+	export CC_powerpc_unknown_eabi="${PPC_BIN}/powerpc-eabi-gcc"
+	export CXX_powerpc_unknown_eabi="${PPC_BIN}/powerpc-eabi-g++"
+	export AR_powerpc_unknown_eabi="${PPC_BIN}/powerpc-eabi-gcc-ar"
+	export CARGO_TARGET_POWERPC_UNKNOWN_EABI_LINKER="${PPC_BIN}/powerpc-eabi-gcc"
+	# panic=abort fica no alvo, não no host: o proc-macro continua com unwind.
+	# zeebx_wii encolhe o heap e o cache de som. O Broadway não tem AltiVec.
+	# O alvo declara atômico de 64 bits para o `AtomicU64` que o egui usa. O LLVM
+	# não emite lqarx: vira chamada de `__atomic_*_8`. O libgcc daqui não tem
+	# essas funções; o `compat.c` implementa com a interrupção desligada.
+	export CARGO_TARGET_POWERPC_UNKNOWN_EABI_RUSTFLAGS="--cfg zeebx_wii -C panic=abort -C target-cpu=750"
+	# -I aponta para o ioctl.h que o newlib não tem e o sqlite inclui mesmo assim.
+	export CFLAGS_powerpc_unknown_eabi="-mcpu=750 -meabi -mhard-float -mno-altivec -mrvl -I$AQUI/compat"
+	# O newlib não tem mmap de verdade. WAL e mmap do sqlite ficam desligados,
+	# como no Switch, para o .a não pedir um símbolo que o console não tem.
+	export LIBSQLITE3_FLAGS="-DSQLITE_OMIT_WAL -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_OMIT_LOAD_EXTENSION"
+	export RUSTC_BOOTSTRAP=1
+	export RUST_TARGET_PATH="$AQUI"
+	mkdir -p "$saida"
+	# A sondagem do cargo chama o rustc sem `-Z json-target-spec`. Sem este
+	# prefixo o alvo customizado é recusado antes de qualquer compilação.
+	# Fica em /tmp, não no volume: alguns mounts recusam executar o que foi escrito neles.
+	local rustc_wii="/tmp/zeebx-rustc-wii"
+	cat >"$rustc_wii" <<'EOF'
+#!/bin/sh
+exec rustc -Z unstable-options "$@"
+EOF
+	chmod +x "$rustc_wii"
+	export RUSTC="$rustc_wii"
+
+	cd "$RAIZ"
+	cargo rustc -Z build-std=std,panic_abort -Z json-target-spec \
+		--release --locked \
+		-p zeebx-libretro \
+		--target powerpc-unknown-eabi \
+		--crate-type staticlib
+	bash "$AQUI/bundle-native-libs.sh"
+
+	local ar_bin="${PPC_BIN}/powerpc-eabi-gcc-ar"
+	local compat="${saida}/compat.o"
+	# -fno-builtin: o gcc conhece __atomic_compare_exchange_8 com outra assinatura
+	# (tem o parâmetro weak). O LLVM chama a versão sem ele. Sem isto o gcc trata
+	# a nossa definição como se fosse o builtin e o tipo não fecha.
+	"${PPC_BIN}/powerpc-eabi-gcc" -mcpu=750 -meabi -mhard-float -mno-altivec -mrvl \
+		-fno-builtin -c "$AQUI/compat.c" -o "$compat"
+	"${ar_bin}" r "$RAIZ/target/powerpc-unknown-eabi/release/libzeebx_libretro.a" "$compat"
+	"${ar_bin}" s "$RAIZ/target/powerpc-unknown-eabi/release/libzeebx_libretro.a" >/dev/null
+	rm -f "$compat"
+
+	cp -f "$RAIZ/target/powerpc-unknown-eabi/release/libzeebx_libretro.a" \
+		"$saida/libzeebx_libretro_wii.a"
+
+	# Prova de que o RetroArch consegue ligar o arquivo: um main que chama a ABI,
+	# com --whole-archive, contra o newlib e o libogc que o -mrvl puxa.
+	local prova
+	prova="$(mktemp -d)"
+	cat >"$prova/main.c" <<'EOF'
+unsigned retro_api_version(void);
+int main(void) { return retro_api_version() == 1 ? 0 : 1; }
+EOF
+	# -logc traz o __app_start e o sbrk do console. Sem ele o -mrvl liga só o
+	# newlib, e o _sbrk_r pede um __end__ que o script do Wii não define.
+	"${PPC_BIN}/powerpc-eabi-gcc" -mcpu=750 -meabi -mhard-float -mno-altivec -mrvl -O2 \
+		-L"${DEVKITPRO}/libogc/lib/wii" \
+		-o "$prova/prova.elf" "$prova/main.c" \
+		-Wl,--whole-archive "$saida/libzeebx_libretro_wii.a" -Wl,--no-whole-archive \
+		-logc -lm
+	"${PPC_BIN}/powerpc-eabi-objdump" -f "$prova/prova.elf" | grep -q elf32-powerpc
+	rm -rf "$prova"
+
+	echo "built: $saida/libzeebx_libretro_wii.a"
+	echo "no RetroArch: copie para libretro_wii.a e rode make -f Makefile.griffin platform=wii"
+}
+
+if [[ "${1:-}" == "--local" ]]; then
+	shift
+	compilar_local "$@"
+	exit 0
+fi
+
+SAIDA="${1:-$AQUI/saida}"
+mkdir -p "$SAIDA"
+
+docker run --rm --platform linux/amd64 \
+	-v "$RAIZ:/src" \
+	-w /src \
+	"$IMAGEM" \
+	bash -lc "set -euo pipefail
+export DEVKITPRO=/opt/devkitpro
+export DEVKITPPC=/opt/devkitpro/devkitPPC
+export PATH=\"/opt/devkitpro/devkitPPC/bin:\$PATH\"
+if ! command -v rustc >/dev/null 2>&1 || ! [[ -d \"\$(rustc --print sysroot)/lib/rustlib/src/rust/library/std\" ]]; then
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config
+  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --component rust-src
+fi
+. \"\$HOME/.cargo/env\"
+cd /src
+./frontends/wii/compilar.sh --local /src/frontends/wii/saida
+"
+
+if [[ "$SAIDA" != "$AQUI/saida" ]]; then
+	cp -f "$AQUI/saida/libzeebx_libretro_wii.a" "$SAIDA/"
+	echo "built: $SAIDA/libzeebx_libretro_wii.a"
+fi

@@ -15,6 +15,7 @@
 #   zeebx_libretro-linux-aarch64.zip         o core Libretro, com o `.info`, para RetroArch
 #   zeebx_libretro-wasm.zip                  o mesmo core em WebAssembly, para o ROMBundler
 #   zeebx_libretro-switch.zip                o core como `.a` estático, para o ROMBundler ligar no Switch
+#   zeebx_libretro-wii.zip                   o core como `.a` estático, para o RetroArch ligar no Wii
 #
 # O APK sai assinado com a chave de depuração, que é a que o Gradle gera sozinho. Serve para
 # instalar de lado (`adb install`), **não** para a Play Store: aquela pede a chave de publicação,
@@ -607,6 +608,57 @@ jobs:
           path: zeebx_libretro-switch.zip
           if-no-files-found: error
 
+  # O devkitPPC não está no runner: o job roda na imagem do devkitPro, como o `core-wii` do
+  # `libretro.yml`. O `.a` vira `libretro_wii.a` na raiz do RetroArch antes do `Makefile.griffin`.
+  wii:
+    name: core-wii
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: devkitpro/devkitppc:20260503
+    steps:
+      - name: Git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git pkg-config python3 zip
+
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: core-wii
+
+      - name: Compila o staticlib
+        run: ./frontends/wii/compilar.sh --local
+
+      - name: O arquivo é PowerPC
+        run: |
+          tmp=$(mktemp -d)
+          ( cd "$tmp" && ar x "$GITHUB_WORKSPACE/frontends/wii/saida/libzeebx_libretro_wii.a" )
+          ruim=$(powerpc-eabi-objdump -f "$tmp"/*.o | grep 'file format' | grep -v elf32-powerpc || true)
+          if [ -n "$ruim" ]; then
+            echo "o .a misturou objeto que não é PowerPC"
+            echo "$ruim"
+            exit 1
+          fi
+
+      - name: Empacota o core
+        run: |
+          mkdir -p frontends/wii/saida/licenses && cp LICENSE LICENSE-GPL3 THIRD-PARTY-NOTICES.txt frontends/wii/saida/licenses/
+          cd frontends/wii/saida
+          zip -r "$GITHUB_WORKSPACE/zeebx_libretro-wii.zip" libzeebx_libretro_wii.a licenses
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeebx_libretro_wii
+          path: zeebx_libretro-wii.zip
+          if-no-files-found: error
+
   # O `THIRD-PARTY-NOTICES.txt` que vai em todos os pacotes é versionado, e não gerado em cada job:
   # o contêiner do Switch e o runner do Windows não teriam de instalar o `cargo about`. O preço é
   # ele poder envelhecer com um `cargo update`, e é isto que pega: a release não sai com avisos
@@ -624,7 +676,7 @@ jobs:
         run: python3 ferramentas/avisos_de_terceiros.py --confere
 
   release:
-    needs: [standalone-qt, standalone-egui, headless, android, ios, core, wasm, switch, licencas]
+    needs: [standalone-qt, standalone-egui, headless, android, ios, core, wasm, switch, wii, licencas]
     # Sai com o que deu certo: um sistema que falhou não segura os outros.
     #
     # A tag vem de dois lugares: do `push` de uma tag, e aí é o `github.ref_name`; ou do

@@ -7,7 +7,8 @@
 //! escrita que ignora o que o host gravou.
 //!
 //! Não foi medido contra o JIT. O desktop continua no `dynarmic`; isto entra no `wasm32`, onde
-//! o bloco emitido não roda, e no iOS, onde o sistema não deixa o processo mapear código.
+//! o bloco emitido não roda, no iOS, onde o sistema não deixa o processo mapear código, e no
+//! PowerPC do core de Wii, onde o Dynarmic não tem o que emitir.
 
 use super::mem::GuestMemory;
 use super::{API_BASE, API_SIZE, RETURN_MAGIC, apara_semihosting};

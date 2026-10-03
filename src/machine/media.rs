@@ -24,6 +24,12 @@ const MAX_SONS_GUARDADOS: usize = 64;
 /// banco a 44.100 em vez de 22.050 **dobra** o PCM de cada música. Num aparelho de mão o que
 /// sobra de RAM é pouco, e o custo de esquecer é uma re-síntese; o custo de não esquecer é o
 /// sistema matar o processo.
+/// No Wii o teto de 24 MB começaria maior que a folga do MEM2. 4 MB não foi medido num jogo:
+/// é o que sobra depois do heap do guest e do RetroArch. O perfil do core ainda pode baixar
+/// mais, não subir daqui sem passar por `define_teto_do_cache_de_som`.
+#[cfg(zeebx_wii)]
+const MAX_BYTES_DE_SOM: usize = 4 * 1024 * 1024;
+#[cfg(not(zeebx_wii))]
 const MAX_BYTES_DE_SOM: usize = 24 * 1024 * 1024;
 
 /// O teto escolhido agora, que começa em [`MAX_BYTES_DE_SOM`] e o frontend pode mudar.
