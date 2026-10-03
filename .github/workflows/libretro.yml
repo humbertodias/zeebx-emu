@@ -231,12 +231,13 @@ jobs:
   # do Broadway e prova o link contra o libogc.
   wii:
     name: core-wii
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
       # Tag datada, não `latest`: a imagem nova entra quando alguém muda esta linha.
       # A mesma tag está no default de `frontends/wii/compilar.sh`.
-      image: devkitpro/devkitppc:20260503
+      image: reallibretroretroarch/libretro-build-devkitpro:latest
+      options: --user root
     steps:
       - name: Git
         run: |
