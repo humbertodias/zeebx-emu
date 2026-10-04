@@ -747,7 +747,7 @@ FRACO unsigned long getauxval(unsigned long tipo) {
     return 0;
 }
 
-FRACO int sigaltstack(const void *nova, void *antiga) {
+FRACO int sigaltstack(const stack_t *__restrict nova, stack_t *__restrict antiga) {
     (void)nova;
     (void)antiga;
     return 0;
