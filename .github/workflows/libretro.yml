@@ -260,7 +260,7 @@ jobs:
 
       - name: O arquivo é PowerPC
         run: |
-          docker run --rm --platform linux/amd64 \
+          docker run --rm --platform linux/amd64 --user root \
             -v "$GITHUB_WORKSPACE:/src" -w /src \
             reallibretroretroarch/libretro-build-devkitpro:latest \
             bash -lc '

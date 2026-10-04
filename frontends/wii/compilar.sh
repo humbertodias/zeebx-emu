@@ -120,7 +120,9 @@ mkdir -p "$SAIDA"
 
 # Esses dois diretórios, se o CI os definir, sobrevivem ao --rm. Sem eles o
 # rustup fica em /root e some com o contêiner.
-docker_args=(--rm --platform linux/amd64 -v "$RAIZ:/src" -w /src)
+# A imagem entra com um usuário sem permissão de escrita em /var/lib/apt. O CI do
+# RetroArch sobe a mesma imagem com --user root pelo mesmo motivo.
+docker_args=(--rm --platform linux/amd64 --user root -v "$RAIZ:/src" -w /src)
 if [[ -n "${ZEEBX_WII_CARGO_HOME:-}" ]]; then
 	mkdir -p "$ZEEBX_WII_CARGO_HOME"
 	docker_args+=(-v "$ZEEBX_WII_CARGO_HOME:/usr/local/cargo" -e CARGO_HOME=/usr/local/cargo)
