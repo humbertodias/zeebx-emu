@@ -191,12 +191,14 @@ struct stat_glibc64 {
     long long st_size;
     long st_blksize;
     long long st_blocks;
-    long st_atime;
-    long st_atime_nsec;
-    long st_mtime;
-    long st_mtime_nsec;
-    long st_ctime;
-    long st_ctime_nsec;
+    /* O newlib define st_atime como macro de st_atim.tv_sec. Os nomes daqui
+       não podem ser esses, senão o campo vira um acesso com ponto. */
+    long atime;
+    long atime_nsec;
+    long mtime;
+    long mtime_nsec;
+    long ctime;
+    long ctime_nsec;
     unsigned long reservado4;
     unsigned long reservado5;
 };
@@ -222,9 +224,9 @@ static void copia_stat(struct stat_glibc64 *para, const struct stat *de) {
     para->st_size = de->st_size;
     para->st_blksize = de->st_blksize;
     para->st_blocks = de->st_blocks;
-    para->st_atime = de->st_atime;
-    para->st_mtime = de->st_mtime;
-    para->st_ctime = de->st_ctime;
+    para->atime = de->st_atime;
+    para->mtime = de->st_mtime;
+    para->ctime = de->st_ctime;
 }
 
 static int abre(const char *caminho, int flags, int modo) {
@@ -549,7 +551,7 @@ FRACO void *dlsym(void *handle, const char *nome) {
     return NULL;
 }
 
-FRACO int fchown(int fd, unsigned int uid, unsigned int gid) {
+FRACO int fchown(int fd, uid_t uid, gid_t gid) {
     (void)fd;
     (void)uid;
     (void)gid;
@@ -557,7 +559,7 @@ FRACO int fchown(int fd, unsigned int uid, unsigned int gid) {
     return -1;
 }
 
-FRACO unsigned int geteuid(void) { return 0; }
+FRACO uid_t geteuid(void) { return 0; }
 
 FRACO ssize_t readlink(const char *caminho, char *buf, size_t tamanho) {
     (void)caminho;
