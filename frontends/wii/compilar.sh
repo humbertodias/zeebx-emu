@@ -139,8 +139,18 @@ export DEVKITPRO=/opt/devkitpro
 export DEVKITPPC=/opt/devkitpro/devkitPPC
 export PATH=\"\${CARGO_HOME:-\$HOME/.cargo}/bin:/opt/devkitpro/devkitPPC/bin:\$PATH\"
 if ! command -v rustc >/dev/null 2>&1 || ! [[ -d \"\$(rustc --print sysroot)/lib/rustlib/src/rust/library/std\" ]]; then
-  apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config
+  if ! command -v curl >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1; then
+    # O Stretch saiu do deb.debian.org. O arquivo ainda serve os pacotes, mas o
+    # Release e a chave de assinatura expiraram, e o apt recusa o índice sem isto.
+    sed -i '/stretch/d' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+    printf '%s\n' \
+      'deb [trusted=yes] http://archive.debian.org/debian stretch main' \
+      'deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main' \
+      > /etc/apt/sources.list
+    printf '%s\n' 'Acquire::Check-Valid-Until \"false\";' > /etc/apt/apt.conf.d/99archive
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config
+  fi
   curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --component rust-src
 fi
 . \"\${CARGO_HOME:-\$HOME/.cargo}/env\"
