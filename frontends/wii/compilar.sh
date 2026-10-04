@@ -47,11 +47,11 @@ compilar_local() {
 	# essas funções; o `compat.c` implementa com a interrupção desligada.
 	export CARGO_TARGET_POWERPC_UNKNOWN_EABI_RUSTFLAGS="--cfg zeebx_wii -C panic=abort -C target-cpu=750"
 	# -I aponta para o ioctl.h que o newlib não tem e o sqlite inclui mesmo assim.
-	export CFLAGS_powerpc_unknown_eabi="-mcpu=750 -meabi -mhard-float -mno-altivec -mrvl -I$AQUI/compat"
-	# O newlib dessa imagem tem pthread.h sem PTHREAD_MUTEX_INITIALIZER, e o
-	# sqlite em THREADSAFE=1 não compila. O banco é chamado no fio da emulação.
+	# -include cobre o pthread.h dessa imagem, que não tem PTHREAD_MUTEX_INITIALIZER.
+	# Sem isso o sqlite (THREADSAFE=1, que o rusqlite exige) não compila.
+	export CFLAGS_powerpc_unknown_eabi="-mcpu=750 -meabi -mhard-float -mno-altivec -mrvl -I$AQUI/compat -include $AQUI/compat/pthread_wii.h"
 	# WAL e mmap ficam desligados: o newlib não tem mmap de verdade.
-	export LIBSQLITE3_FLAGS="-USQLITE_THREADSAFE -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_WAL -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_OMIT_LOAD_EXTENSION"
+	export LIBSQLITE3_FLAGS="-DSQLITE_OMIT_WAL -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_OMIT_LOAD_EXTENSION"
 	export RUSTC_BOOTSTRAP=1
 	export RUST_TARGET_PATH="$AQUI"
 	mkdir -p "$saida"
