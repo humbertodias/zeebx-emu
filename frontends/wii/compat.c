@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 extern int *__errno(void);
@@ -674,6 +675,87 @@ FRACO void freeaddrinfo(void *res) { (void)res; }
 FRACO const char *gai_strerror(int err) {
     (void)err;
     return "name resolution failed";
+}
+
+FRACO ssize_t recv(int fd, void *buf, size_t tamanho, int flags) {
+    (void)fd;
+    (void)buf;
+    (void)tamanho;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+FRACO ssize_t send(int fd, const void *buf, size_t tamanho, int flags) {
+    (void)fd;
+    (void)buf;
+    (void)tamanho;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+FRACO int setsockopt(int fd, int nivel, int nome, const void *val, unsigned int tamanho) {
+    (void)fd;
+    (void)nivel;
+    (void)nome;
+    (void)val;
+    (void)tamanho;
+    errno = ENOSYS;
+    return -1;
+}
+
+FRACO ssize_t readv(int fd, const struct iovec_glibc *iov, int n) {
+    ssize_t total = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        ssize_t lido = read(fd, iov[i].iov_base, iov[i].iov_len);
+        if (lido < 0) {
+            return total > 0 ? total : lido;
+        }
+        total += lido;
+        if ((size_t)lido < iov[i].iov_len) {
+            break;
+        }
+    }
+    return total;
+}
+
+/* A std chama isto no meio de um canal quando o outro lado ainda não
+   entregou. Não há outro fio: voltar na hora evita dormir o quadro. */
+FRACO int sched_yield(void) { return 0; }
+
+/* thread::sleep passa flags 0 e um intervalo relativo. O retorno é o número
+   do erro, não -1: a std compara com EINTR. */
+FRACO int clock_nanosleep(int relogio, int flags, const struct timespec *pedido,
+                          struct timespec *restante) {
+    (void)relogio;
+    if (!pedido) {
+        return EINVAL;
+    }
+    if (flags & 1) {
+        return 0;
+    }
+    if (nanosleep(pedido, restante) == 0) {
+        return 0;
+    }
+    return errno ? errno : EINTR;
+}
+
+FRACO unsigned long getauxval(unsigned long tipo) {
+    (void)tipo;
+    return 0;
+}
+
+FRACO int sigaltstack(const void *nova, void *antiga) {
+    (void)nova;
+    (void)antiga;
+    return 0;
+}
+
+FRACO int pause(void) {
+    errno = EINTR;
+    return -1;
 }
 
 FRACO const char *gnu_get_libc_version(void) { return "2.31"; }
