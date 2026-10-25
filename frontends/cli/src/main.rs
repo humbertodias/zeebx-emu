@@ -1,9 +1,7 @@
-//! Zeebx — emulador de Zeebo / Qualcomm BREW.
-
-// No Windows, a versão de distribuição abre sem a janela de console atrás da interface. O preço é
-// a linha de comando (`zeebx run`, `zeebx sessao`) não escrever no terminal nessa versão; para
-// ela, o build de desenvolvimento continua com console.
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+//! Zeebx — a linha de comando do emulador de Zeebo / Qualcomm BREW.
+//!
+//! Rodar, medir e inspecionar um jogo sem a interface: `run`, `sessao`, `bench`, `info`,
+//! `controles` e `wiimote`. A interface é o `zeebx-qt`, em `frontends/qt-standalone`.
 
 // O binário consome o motor como biblioteca: nada aqui redeclara módulos, e `desktop` decide
 // quais deles entram na compilação.
@@ -18,7 +16,6 @@ use zeebx::loader::archive;
 use zeebx::loader::modfile::{ModImage, Variant};
 use zeebx::machine::{AppletResult, Machine, Outcome};
 use zeebx::ui::window;
-use zeebx::video::icon;
 
 /// Teto de instruções por fatia entre duas chamadas de API — evita que um laço infinito no
 /// guest trave o emulador. Precisa ser generoso: a inicialização do Bejeweled Twist passa
@@ -45,7 +42,7 @@ const PROFILE_LINES: usize = 20;
 const SEMIHOSTING_LINES: usize = 40;
 
 fn main() -> ExitCode {
-    // **O nível do registro entra aqui também.** A janela o lê ao abrir (`ui::app`), e os comandos
+    // **O nível do registro entra aqui também.** A janela o lê ao abrir (o `zeebx-qt`), e os comandos
     // de linha de comando não o liam: `ZEEBX_LOG=informacao` era ignorado em `run`, `bench` e
     // `sessao`, e as linhas de instrumento -- todas de `Informacao` -- não apareciam. Foi assim que
     // duas medidas minhas saíram vazias antes de eu perceber.
@@ -408,6 +405,13 @@ fn main() -> ExitCode {
                 .unwrap_or_default();
             let placa = args.iter().any(|a| a == "--placa");
             let serial = args.iter().find_map(|a| a.strip_prefix("--serial="));
+            // Como no `run`: o filtro sozinho não liga nada, e ligar sem filtro mostra tudo.
+// Antes este ramo nem lia a opção, e o `--trace` do uso do `sessao` não fazia nada.
+            let tracing = args.iter().any(|a| a.starts_with("--trace"));
+            let trace_filter = args
+                .iter()
+                .find_map(|a| a.strip_prefix("--trace="))
+                .map(str::to_owned);
             // Sem nada, valem as preferências da Z-Wheel gravadas; `--fabrica` usa a cfg do pacote
             // como veio, e os outros dois trocam uma opção só.
             let mut z_wheel = match args.iter().any(|a| a == "--fabrica") {
@@ -482,14 +486,11 @@ fn main() -> ExitCode {
             };
             report(sessao_sem_janela(
                 &args[1], seconds, dump, &keys, &fotos, placa, serial, z_wheel, escala, melhorias,
-                perfil, boomerang, portas,
+                perfil, boomerang, portas, tracing, trace_filter,
             ))
         }
-        // Sem argumento nenhum, o que se quer é o emulador, não a ajuda.
-        None => launch(),
         _ => {
-            eprintln!("uso: zeebx            abre a interface");
-            eprintln!("     zeebx info <arquivo.mod>");
+            eprintln!("uso: zeebx info <arquivo.mod>     (a interface é o zeebx-qt)");
             eprintln!(
                 "     zeebx run <arquivo.mod> [--window] [--seconds=N] [--keys=ms:tecla,...]
                              [--dump-gl=DIR] [--dump-audio=ARQUIVO.wav]
@@ -506,67 +507,6 @@ fn main() -> ExitCode {
             eprintln!(
                 "     zeebx bench <arquivo.mod|zip> [--seconds=N] [--keys=ms:tecla,...] [--dump=QUADRO.bmp] [--teclas=ms:nome,...] [--instalados=0xCLSID[:id],...] [--dump-surfaces=DIR] [--dpad-nos-eixos]  (Dynarmic, sem janela)"
             );
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Abre a interface.
-///
-/// É o caminho normal de uso; a linha de comando continua existindo para depuração, que é
-/// onde ela é insubstituível — despejar quadros, rastrear chamadas, olhar a memória.
-/// A logo do emulador, para o ícone da janela.
-const LOGO: &[u8] = include_bytes!("../../../assets/zeebx.png");
-
-/// O maior lado do ícone. A logo tem mais de mil pixels de lado, e um ícone desse tamanho é
-/// megabytes de textura para desenhar algo que nunca passa de alguns pixels na barra.
-const ICON_SIDE: usize = 256;
-
-/// Identificador da janela para o desktop. Casa com `assets/zeebx.desktop` — se um mudar, o
-/// outro muda junto, senão o ícone some no Wayland.
-const APP_ID: &str = "zeebx";
-
-/// A logo no tamanho de ícone. `None` se ela não abrir — uma janela sem ícone é melhor que uma
-/// janela que não abre.
-fn window_icon() -> Option<zeebx::eframe::egui::IconData> {
-    let logo = icon::decode(LOGO)
-        .inspect_err(|err| eprintln!("ícone da janela: {err}"))
-        .ok()?
-        .downscaled(ICON_SIDE);
-    Some(zeebx::eframe::egui::IconData {
-        width: logo.width as u32,
-        height: logo.height as u32,
-        rgba: logo.rgba,
-    })
-}
-
-fn launch() -> ExitCode {
-    let mut viewport = zeebx::eframe::egui::ViewportBuilder::default()
-        .with_inner_size([960.0, 720.0])
-        .with_min_inner_size([480.0, 360.0])
-        .with_title("Zeebx")
-        // No Wayland não existe ícone em pixels: o compositor casa este `app_id` com o
-        // `zeebx.desktop` instalado e tira o ícone de lá. Sem ele, a janela fica com o
-        // genérico do sistema. Precisa ser igual ao nome do arquivo `.desktop`.
-        .with_app_id(APP_ID);
-    viewport = ui::settings::Settings::load()
-        .graphics
-        .janela
-        .no_construtor(viewport);
-    if let Some(icon) = window_icon() {
-        viewport = viewport.with_icon(icon);
-    }
-    let options = zeebx::eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
-    let app = |context: &zeebx::eframe::CreationContext<'_>| {
-        Ok(Box::new(ui::App::new(context)) as Box<dyn zeebx::eframe::App>)
-    };
-    match zeebx::eframe::run_native("Zeebx", options, Box::new(app)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("erro: não deu para abrir a janela: {err}");
             ExitCode::FAILURE
         }
     }
@@ -1315,7 +1255,7 @@ fn bench_dynarmic(
 /// A bancada monta a máquina por conta própria, e o que ela mostra pode não ser o que a janela
 /// mostra: a janela instala todos os jogos da biblioteca, passa o controle pela sessão e traduz o
 /// direcional em teclas. Aqui entram as mesmas peças — `Session`, a biblioteca das configurações
-/// e [`ui::App::teclas_do_controle`] —, e o roteiro é de **botões do controle**, como quem joga.
+/// e [`input::teclas_do_controle`] —, e o roteiro é de **botões do controle**, como quem joga.
 /// Com `--dump`, sai um quadro meio segundo depois de cada aperto; o relatório vai inteiro para a
 /// saída no fim.
 fn sessao_sem_janela(
@@ -1332,6 +1272,8 @@ fn sessao_sem_janela(
     perfil: Option<u32>,
     boomerang: Option<Vec<(u32, [f32; 3])>>,
     portas_pedidas: Option<[Option<bindings::Aparelho>; input::PORTAS]>,
+    tracing: bool,
+    trace_filter: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let serial = serial.map(std::path::Path::new);
     let settings = ui::settings::Settings::load();
@@ -1362,6 +1304,8 @@ fn sessao_sem_janela(
     session.define_resolucao_interna(escala);
     session.define_proporcao(proporcao_da_linha());
     session.define_melhorias(melhorias.0, melhorias.1);
+    session.set_tracing(tracing);
+    session.set_trace_filter(trace_filter);
     let mut perfil_ligado_em: Option<(u32, std::time::Instant, u64)> = None;
     session.set_installed_applets(
         games
@@ -1622,6 +1566,12 @@ fn sessao_sem_janela(
     for linha in session.log() {
         println!("{linha}");
     }
+    if tracing {
+        println!("rastreamento:");
+        for line in session.trace() {
+            println!("  {line}");
+        }
+    }
     Ok(())
 }
 
@@ -1713,7 +1663,7 @@ fn describe_outcome(outcome: &Outcome) {
         Outcome::Exception { pc } => println!("exceção do núcleo ARM em pc {pc:#010x}"),
         Outcome::Budget => println!("orçamento de instruções esgotado"),
         Outcome::CallLimit { calls } => {
-            println!("teto de {calls} chamadas de API atingido — provável laço de repetição")
+            println!("{calls} chamadas de API sem devolver a vez — provável laço de repetição")
         }
     }
 }

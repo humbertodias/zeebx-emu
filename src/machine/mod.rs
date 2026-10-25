@@ -55,10 +55,19 @@ mod time;
 mod widget;
 mod zip;
 
-/// Teto para leitura de string do guest, contra ponteiro corrompido.
 /// Teto de uma instrução SQL vinda do guest. As maiores do Z-Wheel têm 110 bytes.
 const MAX_SQL: usize = 4096;
-const MAX_STRING: usize = 4096;
+
+/// Teto para leitura de string do guest, contra ponteiro corrompido.
+///
+/// **Um MiB, e não quatro KB.** O teto só protege de um ponteiro sem terminador: a leitura vai em
+/// blocos até o zero, e uma string curta custa o mesmo com qualquer teto. Mas o jogo não tem teto
+/// nenhum, e com quatro KB o `strlen` mentia. As fases do Alice no País das Maravilhas são código
+/// Lua com o mapa de blocos numa string base64 de uma linha só — 15.426 caracteres na fase 2, e
+/// 202.806 no `stage1-30` —, e o jogo decodificava só os primeiros 4.096. Os blocos vêm em ordem de
+/// linha: tudo abaixo da linha 29 da fase 2 sumia, desenho e colisão. Era a faixa preta no pé da
+/// tela, e a sala da brecha sem chão, onde a Alice caía para sempre.
+const MAX_STRING: usize = 1 << 20;
 
 /// Teto para as conversões de número (`strtoul`, `atoi`, `strtod`).
 ///
@@ -991,11 +1000,16 @@ const MAX_TRACE: usize = 2000;
 /// passasse numa tela com texto.
 const MAX_TEXT: usize = 64;
 
-/// Teto de chamadas de API por execução. O orçamento de instruções não segura um laço que
-/// chama API a cada volta, porque ele é reiniciado a cada chamada atendida.
-/// O teto existe para um laço de repetição não travar o emulador, e é generoso porque um jogo
-/// 3D chama a API às centenas de milhares por segundo: só o Quake faz mais de trezentas
-/// chamadas de OpenGL por quadro.
+/// Teto de chamadas de API num trecho só — uma entrada no [`Machine::execute`], sem devolver a
+/// vez. O orçamento de instruções não segura um laço que chama API a cada volta, porque ele é
+/// reiniciado a cada chamada atendida. O teto existe para um laço de repetição não travar o
+/// emulador, e é generoso porque um jogo 3D chama a API às centenas de milhares por segundo: só
+/// o Quake faz mais de trezentas chamadas de OpenGL por quadro.
+///
+/// **Era por execução, e isso derrubava jogo saudável.** O contador nunca zerava: a umas 330 mil
+/// chamadas por segundo, os 200 milhões acabavam em dez minutos, e o jogo parava com "provável
+/// laço de repetição" no meio da corrida — a issue #70, no Ridge Racer. O que separa laço de
+/// jogo é não devolver a vez, e não o total acumulado.
 const MAX_CALLS: u64 = 200_000_000;
 
 /// Instruções por milissegundo do relógio virtual: o ARM11 do MSM7201A roda a 528 MHz, e o
@@ -1342,6 +1356,9 @@ struct OpenFile {
     /// Onde o arquivo aberto mora no host. Nem sempre é o que o `guest_path` resolve: a
     /// `tectoy.cfg` sem fim de vida é uma cópia no perfil do aparelho.
     caminho: std::path::PathBuf,
+    /// Se foi aberto para escrita. É o que impede o rewind de marcar um ponto no meio de uma
+    /// gravação: ver [`Machine::tem_arquivo_para_escrita`].
+    escrita: bool,
 }
 
 /// Um callback do guest: a função e o contexto que ela recebe.
@@ -2676,8 +2693,9 @@ pub struct Machine<C: CpuBackend> {
     egl_swaps: u32,
     /// Quantos `glClear` limparam a cor. Ver [`Machine::gl_swaps`].
     gl_clears: u32,
-    /// Último nome de textura ou buffer entregue pelo OpenGL ES.
-    gles_next_name: u32,
+    /// Os nomes de textura e de buffer em uso no OpenGL ES. Ver [`gl::NomesGl`].
+    nomes_de_textura: gl::NomesGl,
+    nomes_de_buffer: gl::NomesGl,
     /// O objeto `IGLES11`, criado sob demanda pelo `QueryInterface` do EGL.
     gles_object: u32,
     /// Superfície e contexto correntes do EGL.
@@ -2702,6 +2720,9 @@ pub struct Machine<C: CpuBackend> {
     /// coisa — essa só acontece quando o desenho 2D por cima ou uma leitura de pixels precisa
     /// dela.
     gl_quadro_pendente: bool,
+    /// Um estado acabou de ser restaurado, e a textura da placa não tem o quadro dele. Ver
+    /// [`Machine::quadro_na_placa`].
+    placa_sem_o_quadro: bool,
     /// Quantas vezes o quadro pendente foi trazido para a tela da CPU. Ver
     /// [`Machine::materializacoes_do_quadro_gl`].
     gl_materializacoes: u32,
@@ -2829,7 +2850,8 @@ pub struct Machine<C: CpuBackend> {
     banco_de_som: Option<std::sync::Arc<crate::audio::soundfont::Banco>>,
     /// Quantas vezes cada método foi chamado — o retrato do que o jogo usa.
     calls: BTreeMap<(u32, u32), u64>,
-    /// Total de chamadas atendidas, para aplicar o teto.
+    /// Total de chamadas atendidas desde que o jogo abriu. O teto olha a diferença dentro de um
+    /// trecho ([`MAX_CALLS`]); o total serve à estatística.
     calls_total: u64,
     /// Se o quadro **de agora** deve pular o desenho — 3D e a limpeza de tela, não a lógica.
     ///
@@ -3252,7 +3274,8 @@ impl<C: CpuBackend> Machine<C> {
             egl_next_handle: EGL_HANDLE_BASE,
             egl_swaps: 0,
             gl_clears: 0,
-            gles_next_name: 0,
+            nomes_de_textura: gl::NomesGl::default(),
+            nomes_de_buffer: gl::NomesGl::default(),
             gles_object: 0,
             egl_surface: 0,
             egl_context: 0,
@@ -3261,6 +3284,7 @@ impl<C: CpuBackend> Machine<C> {
             audio: None,
             gl_last_frame_words: Vec::new(),
             gl_quadro_pendente: false,
+            placa_sem_o_quadro: false,
             gl_materializacoes: 0,
             gl: rasterizador(SCREEN_WIDTH as usize, SCREEN_HEIGHT as usize),
             gl_vertices: ArrayPointer::default(),
@@ -3443,6 +3467,9 @@ impl<C: CpuBackend> Machine<C> {
         // primeira volta, porque ela repete a abertura enquanto ninguém toca e cada repetição
         // gasta orçamento.
         let comeco = self.cpu.instructions();
+        // Local, e não um contador que se zera: um callback atendido aqui dentro entra de novo no
+        // `execute`, e zerar na entrada dele esconderia o laço do trecho de fora.
+        let chamadas_no_comeco = self.calls_total;
         let teto = budget.saturating_mul(TETO_DE_TRECHO);
         self.orcamento = budget;
         loop {
@@ -3453,10 +3480,12 @@ impl<C: CpuBackend> Machine<C> {
                 return Ok(Outcome::Budget);
             }
             match self.cpu.run(pc, fatia)? {
-                StopReason::ApiCall { addr } if self.calls_total >= MAX_CALLS => {
+                StopReason::ApiCall { addr }
+                    if self.calls_total - chamadas_no_comeco >= MAX_CALLS =>
+                {
                     let _ = addr;
                     return Ok(Outcome::CallLimit {
-                        calls: self.calls_total,
+                        calls: self.calls_total - chamadas_no_comeco,
                     });
                 }
                 StopReason::ApiCall { addr } => match self.dispatch(addr)? {
@@ -3685,7 +3714,8 @@ impl<C: CpuBackend> Machine<C> {
         if let Some(piso) = piso
             && sp.wrapping_sub(GASTO) >= piso
         {
-            let _ = self.cpu.fill_mem(sp - GASTO, 0, GASTO);
+            // Sem invalidar o JIT: pilha não vira código (ver `CpuBackend::suja_pilha`).
+            let _ = self.cpu.suja_pilha(sp - GASTO, GASTO);
         }
     }
 

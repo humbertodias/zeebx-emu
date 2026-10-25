@@ -1,14 +1,20 @@
 import QtQuick
 import QtQuick.Controls
 
+import zeebx
+
 // A biblioteca em grade: cartões em pé, na proporção das caixas que a Z-Wheel traz, quantos
-// couberem na largura. Ver `src/ui/app/vitrine.rs`, que desenha a mesma grade no egui.
+// couberem na largura. É a grade que a interface do egui tinha (`src/ui/app/vitrine.rs`, até a
+// 0.4.2).
 GridView {
     id: grade
 
     required property var biblioteca
     // Um cartão foi escolhido para jogar: pelo clique, pelo Enter ou pelo controle.
     signal abre(int linha)
+    // O menu do clique direito: as configurações próprias do jogo, ou os detalhes dele.
+    signal configura(int linha)
+    signal inspeciona(int linha)
     // O teclado anda pela grade. Falso com outra janela por cima — ver `Principal.sobreposta`.
     property bool escutando: true
 
@@ -31,6 +37,53 @@ GridView {
     Keys.onReturnPressed: if (escutando) abre(currentIndex)
     Keys.onEnterPressed: if (escutando) abre(currentIndex)
     Keys.onSpacePressed: if (escutando) abre(currentIndex)
+    // O X e o C são as configurações e os detalhes, como o b2 e o b3 do controle — no teclado de
+    // fábrica é onde eles ficam. A tecla Menu e o Shift+F10 abrem o menu do cartão escolhido,
+    // como o clique direito.
+    Keys.onPressed: (evento) => {
+        evento.accepted = false
+        if (!escutando || evento.isAutoRepeat || count === 0)
+            return
+        if (evento.key === Qt.Key_X) {
+            configura(currentIndex)
+        } else if (evento.key === Qt.Key_C) {
+            inspeciona(currentIndex)
+        } else if (evento.key === Qt.Key_Menu
+                   || (evento.key === Qt.Key_F10 && (evento.modifiers & Qt.ShiftModifier))) {
+            menuDoJogo.linha = currentIndex
+            if (currentItem)
+                menuDoJogo.popup(currentItem, currentItem.width / 2, currentItem.height / 2)
+            else
+                menuDoJogo.popup()
+        } else {
+            return
+        }
+        evento.accepted = true
+    }
+
+    // Devolve `valor`, e faz a ligação depender das `versoes`: ver o `depende` do slider.
+    function depende(versoes, valor) {
+        return valor
+    }
+    function tr(chave) {
+        return depende([Idioma.versao], Idioma.texto(chave))
+    }
+
+    // Um só menu para a grade toda, aberto sobre o cartão do clique.
+    Menu {
+        id: menuDoJogo
+
+        property int linha: -1
+
+        MenuItem {
+            text: grade.tr("library.menu.configure") + "  (X)"
+            onTriggered: grade.configura(menuDoJogo.linha)
+        }
+        MenuItem {
+            text: grade.tr("library.menu.details") + "  (C)"
+            onTriggered: grade.inspeciona(menuDoJogo.linha)
+        }
+    }
 
     // O título e a descrição entram em texto rico na dica: um "&" ou um "<" no nome não pode
     // virar marcação.
@@ -119,11 +172,18 @@ GridView {
 
                 anchors.fill: parent
                 hoverEnabled: true
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
                 // O clique devolve o teclado à grade: vindo da busca, as setas continuavam no campo.
-                onClicked: {
+                // O direito escolhe o cartão e abre o menu dele, sem jogar.
+                onClicked: (mouse) => {
                     grade.forceActiveFocus()
                     grade.currentIndex = cartao.index
-                    grade.abre(cartao.index)
+                    if (mouse.button === Qt.RightButton) {
+                        menuDoJogo.linha = cartao.index
+                        menuDoJogo.popup()
+                    } else {
+                        grade.abre(cartao.index)
+                    }
                 }
             }
 

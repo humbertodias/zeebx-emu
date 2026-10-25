@@ -56,6 +56,7 @@ pub mod qobject {
         #[qproperty(bool, screenshot_falhou, cxx_name = "screenshotFalhou")]
         #[qproperty(QString, screenshot_pasta, cxx_name = "screenshotPasta")]
         #[qproperty(i32, screenshot_serie, cxx_name = "screenshotSerie")]
+        #[qproperty(QString, indicadores)]
         type TelaDoJogo = super::TelaDoJogoRust;
 
         /// Uma volta: entrada, emulação e, se a tela mudou, um quadro novo.
@@ -88,6 +89,16 @@ pub mod qobject {
         #[qinvokable]
         fn pausa(self: Pin<&mut Self>) -> bool;
 
+        /// Se o `Qt::Key` é o atalho de reiniciar. Ver `atalhos.reiniciar`.
+        #[qinvokable]
+        #[cxx_name = "ehAtalhoDeReinicio"]
+        fn eh_atalho_de_reinicio(self: &Self, codigo: i32) -> bool;
+
+        /// Recomeça o jogo aberto. Devolve se recomeçou; falhando, o de antes continua, e a
+        /// linha de estado diz por quê.
+        #[qinvokable]
+        fn reinicia(self: Pin<&mut Self>) -> bool;
+
         /// Relê o título do jogo aberto para a linha de estado. A janela chama isto ao aparecer.
         #[qinvokable]
         fn atualiza(self: Pin<&mut Self>);
@@ -98,6 +109,23 @@ pub mod qobject {
         #[cxx_name = "modoDaJanela"]
         fn modo_da_janela(self: &Self) -> i32;
 
+        /// A largura em que a janela do jogo estava quando foi fechada, em pontos, ou zero
+        /// sem tamanho guardado. Ver `graphics.tamanho_da_janela_do_jogo`.
+        #[qinvokable]
+        #[cxx_name = "larguraDaJanela"]
+        fn largura_da_janela(self: &Self) -> f64;
+
+        /// A altura em que a janela do jogo estava quando foi fechada, em pontos, ou zero
+        /// sem tamanho guardado. Ver `graphics.tamanho_da_janela_do_jogo`.
+        #[qinvokable]
+        #[cxx_name = "alturaDaJanela"]
+        fn altura_da_janela(self: &Self) -> f64;
+
+        /// Guarda o tamanho atual da janela do jogo. Como na principal: depois de um tempo
+        /// sem mudar de tamanho, e ao fechar. Ver `graphics.tamanho_da_janela_do_jogo`.
+        #[qinvokable]
+        #[cxx_name = "guardaTamanhoDaJanela"]
+        fn guarda_tamanho_da_janela(self: &Self, largura: f64, altura: f64);
 
         /// O jogo saiu sozinho e não há para onde voltar: a janela fecha, como a do egui.
         #[qsignal]
@@ -137,7 +165,7 @@ use std::pin::Pin;
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::{QImage, QImageFormat, QList, QRectF, QString};
 
-use zeebx::eframe::egui::Key;
+use zeebx::egui::Key;
 use zeebx::ui::partida::enquadra;
 use zeebx::ui::settings::ModoDaJanela;
 
@@ -164,6 +192,8 @@ pub struct TelaDoJogoRust {
     screenshot_falhou: bool,
     screenshot_pasta: QString,
     screenshot_serie: i32,
+    /// O "▶▶ 3x" do fast-forward e o "Turbo"; vazio esconde.
+    indicadores: QString,
     /// A tela que foi para o `ItemDoQuadro` como imagem: série e escritas. Igual, não há o que
     /// subir. `None` quando o que está lá é a textura da placa, ou nada.
     chave: Option<(u64, u64)>,
@@ -209,7 +239,11 @@ impl qobject::TelaDoJogo {
         let (volta, mostra, destino, suave, depuracao) = nucleo::com(|nucleo| {
             let volta = nucleo.passo(area);
             let depuracao = nucleo.depuracao();
-            let graficos = &nucleo.settings.graphics;
+            // Copiados antes: o `quadro` empresta o núcleo inteiro para trazer o quadro da placa.
+            let (scaling, keep_aspect, smooth) = {
+                let graficos = &nucleo.valendo().graphics;
+                (graficos.scaling, graficos.keep_aspect, graficos.smooth)
+            };
             // O quadro largo experimental tem a proporção dele; o resto é o 4:3 do console.
             let (mostra, aspecto) = match nucleo.quadro() {
                 Some(Quadro::Placa(quadro)) => (
@@ -236,8 +270,8 @@ impl qobject::TelaDoJogo {
                 }
                 None => (Mostra::Nada, 4.0 / 3.0),
             };
-            let enquadrado = enquadra(area, graficos.scaling, graficos.keep_aspect, aspecto);
-            (volta, mostra, centrado(area, enquadrado), graficos.smooth, depuracao)
+            let enquadrado = enquadra(area, scaling, keep_aspect, aspecto);
+            (volta, mostra, centrado(area, enquadrado), smooth, depuracao)
         });
         match mostra {
             Mostra::Textura { textura, recorte } => {
@@ -296,6 +330,10 @@ impl qobject::TelaDoJogo {
             let serie = self.screenshot_serie().wrapping_add(1);
             self.as_mut().set_screenshot_serie(serie);
         }
+        let indicadores = QString::from(&volta.indicadores);
+        if self.indicadores() != &indicadores {
+            self.as_mut().set_indicadores(indicadores);
+        }
         let parou = QString::from(&volta.parou);
         if self.parou() != &parou {
             self.as_mut().set_parou(parou);
@@ -341,6 +379,34 @@ impl qobject::TelaDoJogo {
         })
     }
 
+    pub fn eh_atalho_de_reinicio(&self, codigo: i32) -> bool {
+        tecla_do_qt(codigo).is_some_and(|tecla| nucleo::com(|nucleo| nucleo.e_atalho_de_reinicio(tecla)))
+    }
+
+    pub fn reinicia(mut self: Pin<&mut Self>) -> bool {
+        let (resultado, estado) = nucleo::com(|nucleo| {
+            let resultado = nucleo.reinicia();
+            let estado = match &resultado {
+                Ok(()) => nucleo.estado(),
+                Err(erro) => format!("não reiniciou: {erro}"),
+            };
+            (resultado, estado)
+        });
+        self.as_mut().set_estado(QString::from(&estado));
+        if resultado.is_err() {
+            return false;
+        }
+        // **A textura da partida que acabou não existe mais**, como no `fecha`: o nó não pode
+        // continuar apontando para ela. Apontando, o Qt desenhava um quadro com o número dela — e
+        // a partida nova já tinha dado esse número a outra textura: por um quadro aparecia a
+        // fonte do menu do jogo, em vermelho, no Resident Evil 4, no Ridge Racer e no Rolimã. A
+        // próxima volta manda a imagem nova.
+        self.as_mut().esvazia();
+        self.as_mut().rust_mut().chave = None;
+        self.as_mut().set_parou(QString::default());
+        true
+    }
+
     pub fn atualiza(mut self: Pin<&mut Self>) {
         let estado = nucleo::com(|nucleo| nucleo.estado());
         self.as_mut().set_estado(QString::from(&estado));
@@ -350,6 +416,35 @@ impl qobject::TelaDoJogo {
         nucleo::com(|nucleo| modo(nucleo.settings.graphics.janela_do_jogo))
     }
 
+    pub fn largura_da_janela(&self) -> f64 {
+        nucleo::com(|nucleo| {
+            nucleo
+                .settings
+                .graphics
+                .tamanho_da_janela_do_jogo
+                .map_or(0.0, |[largura, _]| largura as f64)
+        })
+    }
+
+    pub fn altura_da_janela(&self) -> f64 {
+        nucleo::com(|nucleo| {
+            nucleo
+                .settings
+                .graphics
+                .tamanho_da_janela_do_jogo
+                .map_or(0.0, |[_, altura]| altura as f64)
+        })
+    }
+
+    pub fn guarda_tamanho_da_janela(&self, largura: f64, altura: f64) {
+        nucleo::com(|nucleo| {
+            nucleo.settings.graphics.tamanho_da_janela_do_jogo =
+                (largura > 0.0 && altura > 0.0).then_some([largura as f32, altura as f32]);
+            if let Err(erro) = nucleo.settings.save() {
+                eprintln!("não deu para guardar as configurações: {erro}");
+            }
+        })
+    }
 }
 
 /// O `QImage` construído sobre bytes próprios exige linhas alinhadas a quatro bytes. Uma

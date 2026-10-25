@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Shapes
 import QtQuick.Window
 
 import zeebx
@@ -19,16 +20,38 @@ Window {
         return valor
     }
 
-    width: 960
-    height: 760
+    width: larguraGuardada > 0 ? larguraGuardada : 640
+    height: alturaGuardada > 0 ? alturaGuardada : 512
     minimumWidth: 320
     minimumHeight: 240
     visible: false
     color: "black"
     title: "Zeebx — " + tela.estado
 
-    // A janela reaparece a cada jogo aberto: é a hora de ler o título dele.
-    onVisibleChanged: if (visible) tela.atualiza()
+    // Como na principal: o tamanho em que fechar é o tamanho em que reabrir.
+    readonly property real larguraGuardada: tela.larguraDaJanela()
+    readonly property real alturaGuardada: tela.alturaDaJanela()
+
+    function guardaTamanho() {
+        if (visibility === Window.Windowed)
+            tela.guardaTamanhoDaJanela(width, height)
+    }
+
+    onWidthChanged: filaDaGravacao.restart()
+    onHeightChanged: filaDaGravacao.restart()
+
+    Timer {
+        id: filaDaGravacao
+        interval: 500
+        onTriggered: janela.guardaTamanho()
+    }
+
+    // A janela reaparece a cada jogo aberto: é a hora de ler o título dele. O símbolo da pausa
+    // é do jogo que fechou: a partida nova começa andando.
+    onVisibleChanged: if (visible) {
+        tela.atualiza()
+        simbolo.opacity = 0
+    }
 
     // Mostra a janela no modo configurado para ela (`graphics.janela_do_jogo`).
     function abre() {
@@ -51,7 +74,11 @@ Window {
     function alternaTelaCheia() {
         visibility = visibility === Window.FullScreen ? Window.Windowed : Window.FullScreen
     }
-    onClosing: tela.fecha()
+    onClosing: {
+        filaDaGravacao.stop()
+        janela.guardaTamanho()
+        tela.fecha()
+    }
     onActiveChanged: if (!active) tela.solta()
 
     TelaDoJogo {
@@ -65,18 +92,23 @@ Window {
 
         // Esc fecha e P pausa, como na janela do egui. Nenhuma das duas colide com o controle do
         // Zeebo, que usa setas, Z, X, C, V, Q, W, F, G, H, Backspace e Enter. F11 e Alt+Enter
-        // alternam a tela cheia. O screenshot (F9 por padrão, trocável) é perguntado antes do
-        // jogo: um botão mapeado na mesma tecla não a recebe. Ver
-        // `docs/implementacao/22-screenshots.md`.
+        // alternam a tela cheia. O screenshot (F9 por padrão) e o reiniciar (R por padrão),
+        // trocáveis, são perguntados antes do jogo: um botão mapeado na mesma tecla não a recebe.
+        // Ver `docs/implementacao/22-screenshots.md`.
         Keys.onPressed: (evento) => {
             if (tela.ehAtalhoDeScreenshot(evento.key)) {
                 // Segurar a tecla tira um screenshot, e não trinta.
                 if (!evento.isAutoRepeat)
                     tela.screenshot(Qt.formatDateTime(new Date(), "yyyy-MM-dd HH-mm-ss"))
+            } else if (tela.ehAtalhoDeReinicio(evento.key)) {
+                // Segurar não reinicia trinta vezes: o jogo recomeçaria a cada repetição.
+                if (!evento.isAutoRepeat && tela.reinicia())
+                    simbolo.mostra("reinicio", false)
             } else if (evento.key === Qt.Key_Escape) {
                 janela.close()
             } else if (evento.key === Qt.Key_P && !evento.isAutoRepeat) {
-                pausado.visible = tela.pausa()
+                const pausado = tela.pausa()
+                simbolo.mostra(pausado ? "pausa" : "play", pausado)
             } else if (evento.key === Qt.Key_F11
                        || (evento.key === Qt.Key_Return && (evento.modifiers & Qt.AltModifier))) {
                 janela.alternaTelaCheia()
@@ -86,7 +118,8 @@ Window {
             evento.accepted = true
         }
         Keys.onReleased: (evento) => {
-            if (!evento.isAutoRepeat && !tela.ehAtalhoDeScreenshot(evento.key)) {
+            if (!evento.isAutoRepeat && !tela.ehAtalhoDeScreenshot(evento.key)
+                    && !tela.ehAtalhoDeReinicio(evento.key)) {
                 tecla(evento.key, false)
             }
             evento.accepted = true
@@ -96,14 +129,143 @@ Window {
         onFechou: janela.close()
     }
 
-    Text {
-        id: pausado
+    // O símbolo do meio da tela, como num tocador de vídeo: ⏸ enquanto o jogo está pausado; ▶
+    // por um instante quando ele continua; ↻ quando o R o reiniciou. Desenhados, e não letras:
+    // nem toda fonte tem o ⏸ e o ↻, e a janela não sabe qual fonte o sistema vai escolher.
+    Item {
+        id: simbolo
+
+        // "pausa", "play" ou "reinicio".
+        property string forma: ""
+
+        // Mostra `qual`. O que não `fica` some sozinho, esmaecendo.
+        function mostra(qual, fica) {
+            saida.stop()
+            forma = qual
+            opacity = 1
+            if (!fica)
+                saida.restart()
+        }
 
         anchors.centerIn: tela
-        visible: false
+        width: 112
+        height: 112
+        opacity: 0
+        visible: opacity > 0
+
+        SequentialAnimation {
+            id: saida
+
+            PauseAnimation { duration: 350 }
+            NumberAnimation {
+                target: simbolo
+                property: "opacity"
+                to: 0
+                duration: 450
+                easing.type: Easing.InQuad
+            }
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            radius: width / 2
+            color: "#a0000000"
+            border.color: "#60ffffff"
+            border.width: 2
+        }
+
+        Row {
+            anchors.centerIn: parent
+            spacing: 14
+            visible: simbolo.forma === "pausa"
+
+            Repeater {
+                model: 2
+
+                Rectangle {
+                    width: 14
+                    height: 44
+                    radius: 3
+                    color: "white"
+                }
+            }
+        }
+
+        // O triângulo do play, um pouco à direita do centro: o centro de massa dele não é o da
+        // caixa, e centrado pela caixa ele parece puxado para a esquerda.
+        Shape {
+            anchors.centerIn: parent
+            anchors.horizontalCenterOffset: 5
+            width: 44
+            height: 48
+            visible: simbolo.forma === "play"
+            preferredRendererType: Shape.CurveRenderer
+
+            ShapePath {
+                fillColor: "white"
+                strokeColor: "transparent"
+                startX: 0
+                startY: 0
+                PathLine { x: 44; y: 24 }
+                PathLine { x: 0; y: 48 }
+                PathLine { x: 0; y: 0 }
+            }
+        }
+
+        // A seta circular do reinício: um arco de 300 graus, no sentido do relógio, com a ponta
+        // no fim dele.
+        Shape {
+            anchors.centerIn: parent
+            width: 56
+            height: 56
+            visible: simbolo.forma === "reinicio"
+            preferredRendererType: Shape.CurveRenderer
+
+            ShapePath {
+                fillColor: "transparent"
+                strokeColor: "white"
+                strokeWidth: 7
+                capStyle: ShapePath.RoundCap
+                PathAngleArc {
+                    centerX: 28
+                    centerY: 28
+                    radiusX: 21
+                    radiusY: 21
+                    startAngle: -50
+                    sweepAngle: 280
+                }
+            }
+            // A ponta, no fim do arco (230 graus), apontando para onde ele segue.
+            ShapePath {
+                fillColor: "white"
+                strokeColor: "transparent"
+                startX: 28 + 21 * Math.cos(230 * Math.PI / 180) + 12 * Math.cos(320 * Math.PI / 180)
+                startY: 28 + 21 * Math.sin(230 * Math.PI / 180) + 12 * Math.sin(320 * Math.PI / 180)
+                PathLine {
+                    x: 28 + 21 * Math.cos(230 * Math.PI / 180) + 9 * Math.cos(230 * Math.PI / 180)
+                    y: 28 + 21 * Math.sin(230 * Math.PI / 180) + 9 * Math.sin(230 * Math.PI / 180)
+                }
+                PathLine {
+                    x: 28 + 21 * Math.cos(230 * Math.PI / 180) - 9 * Math.cos(230 * Math.PI / 180)
+                    y: 28 + 21 * Math.sin(230 * Math.PI / 180) - 9 * Math.sin(230 * Math.PI / 180)
+                }
+                PathLine {
+                    x: 28 + 21 * Math.cos(230 * Math.PI / 180) + 12 * Math.cos(320 * Math.PI / 180)
+                    y: 28 + 21 * Math.sin(230 * Math.PI / 180) + 12 * Math.sin(320 * Math.PI / 180)
+                }
+            }
+        }
+    }
+
+    // A palavra embaixo do ⏸, para quem não reconhece o símbolo.
+    Text {
+        anchors.top: simbolo.bottom
+        anchors.topMargin: 8
+        anchors.horizontalCenter: simbolo.horizontalCenter
+        visible: simbolo.forma === "pausa" && simbolo.visible
         color: "white"
         style: Text.Outline
-        font.pixelSize: 32
+        font.pixelSize: 20
         text: janela.tr("play.paused")
     }
 
@@ -157,6 +319,29 @@ Window {
                     text: tela.avisoEstado
                 }
             }
+        }
+    }
+
+    // O fast-forward e o turbo ligado, no canto de cima à esquerda, enquanto valem: um alternar
+    // esquecido ligado parece defeito do jogo. Ver `docs/implementacao/24-velocidade.md`.
+    Rectangle {
+        anchors.left: tela.left
+        anchors.top: tela.top
+        anchors.margins: 16
+        width: textoDosIndicadores.implicitWidth + 24
+        height: textoDosIndicadores.implicitHeight + 16
+        visible: tela.indicadores !== ""
+        radius: 6
+        color: "#e6202020"
+        border.color: "#505050"
+
+        Text {
+            id: textoDosIndicadores
+
+            anchors.centerIn: parent
+            color: "white"
+            font.bold: true
+            text: tela.indicadores
         }
     }
 

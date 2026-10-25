@@ -138,10 +138,12 @@ impl Voice {
         at(index) + (at(index + 1) - at(index)) * fraction
     }
 
-    /// Avança um quadro da placa, tratando o fim do som e a repetição.
-    fn advance(&mut self) {
-        self.position += self.step;
-        self.tocados += self.step;
+    /// Avança um quadro da placa, tratando o fim do som e a repetição. `ritmo` é a velocidade do
+    /// jogo: ver [`Mixer::define_avanco`].
+    fn advance(&mut self, ritmo: f64) {
+        let passo = self.step * ritmo;
+        self.position += passo;
+        self.tocados += passo;
         if (self.position as usize) < self.sound.frames() {
             return;
         }
@@ -166,18 +168,18 @@ impl Voice {
     /// **Os dois caminhos da mixagem usam este passo** — o audível e o mudo. O mudo também precisa
     /// consumir a descida: sem isso a voz nunca chegaria ao fim ali, e o teste que cobra "o som
     /// andou até o fim" pegou exatamente isso.
-    fn passo(&mut self) {
-        // Amostra que a síntese ainda não escreveu: ficar parado aqui. Avançar
-        // tocaria silêncio e, quando o buffer aparecesse, a música começaria no meio.
-        if self.descida == 0 {
-            let canais = (self.sound.channels as usize).max(1);
-            let quadro = self.position.floor() as usize;
-            if !self.sound.alcanca(quadro.saturating_add(1) * canais) {
-                return;
-            }
+    fn passo(&mut self, ritmo: f64) {
         }
+            }
+                return;
+            if !self.sound.alcanca(quadro.saturating_add(1) * canais) {
+            let quadro = self.position.floor() as usize;
+            let canais = (self.sound.channels as usize).max(1);
+        if self.descida == 0 {
+        // tocaria silêncio e, quando o buffer aparecesse, a música começaria no meio.
+        // Amostra que a síntese ainda não escreveu: ficar parado aqui. Avançar
         match self.descida {
-            0 => self.advance(),
+            0 => self.advance(ritmo),
             1 => {
                 self.done = true;
                 // **Uma voz que morre antes do fim do som é um corte**, e é o sintoma exato que se
@@ -241,9 +243,11 @@ struct Stream {
 }
 
 impl Stream {
-    /// Avança um quadro da placa e devolve o quadro estéreo daquele instante.
-    fn next_frame(&mut self) -> [f32; 2] {
-        self.fraction += self.step;
+    /// Avança um quadro da placa e devolve o quadro estéreo daquele instante. `ritmo` é a
+    /// velocidade do jogo: a 3x o jogo entrega o triplo de amostras, e a placa as consome no
+    /// mesmo passo, sem a fila crescer até o teto e descartar.
+    fn next_frame(&mut self, ritmo: f64) -> [f32; 2] {
+        self.fraction += self.step * ritmo;
         while self.fraction >= 1.0 {
             self.fraction -= 1.0;
             self.previous = self.current;
@@ -293,6 +297,34 @@ struct State {
     master: f32,
     muted: bool,
     rate: u32,
+    /// A velocidade do jogo em relação ao console: 1 fora do fast-forward. Ver
+    /// [`Mixer::define_avanco`].
+    ritmo: f64,
+    /// Calado pelo fast-forward, à parte do `muted` do usuário: soltar o avanço não pode ligar um
+    /// som que o usuário desligou.
+    abafado: bool,
+    /// Parado pela pausa da janela. Ver [`Mixer::congela`].
+    congelado: bool,
+    /// Quanto do som sai, em quadros de [`DESCIDA_FRAMES`]: cheio fora da pausa, zero dentro dela,
+    /// e no meio enquanto entra ou sai.
+    audivel: u32,
+}
+
+impl State {
+    /// Passa `out` pela rampa da pausa, um quadro por vez.
+    fn rampa_da_pausa(&mut self, out: &mut [f32], channels: usize) {
+        if !self.congelado && self.audivel == DESCIDA_FRAMES {
+            return;
+        }
+        for frame in out.chunks_mut(channels) {
+            self.audivel = match self.congelado {
+                true => self.audivel.saturating_sub(1),
+                false => (self.audivel + 1).min(DESCIDA_FRAMES),
+            };
+            let ganho = self.audivel as f32 / DESCIDA_FRAMES as f32;
+            frame.iter_mut().for_each(|sample| *sample *= ganho);
+        }
+    }
 }
 
 /// O mixer, compartilhado entre o emulador e a linha de execução de áudio.
@@ -313,6 +345,8 @@ impl Mixer {
                 rate,
                 master,
                 muted,
+                ritmo: 1.0,
+                audivel: DESCIDA_FRAMES,
                 ..State::default()
             })),
         }
@@ -322,6 +356,13 @@ impl Mixer {
     ///
     /// `repeat` segue o `MM_PARM_PLAY_REPEAT` do BREW: 1 toca uma vez, 0 toca para sempre.
     pub fn play(&self, id: u32, sound: Arc<Sound>, volume: f32, repeat: u32) {
+        self.play_desde(id, sound, volume, repeat, 0);
+    }
+
+    /// O [`Mixer::play`] com `desde_us` microssegundos do som já tocados, contando as repetições:
+    /// é o que um save state restaurado no meio de um efeito pede. Ver
+    /// [`crate::machine::Machine::restaura_estado`].
+    pub fn play_desde(&self, id: u32, sound: Arc<Sound>, volume: f32, repeat: u32, desde_us: u64) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -361,23 +402,40 @@ impl Mixer {
                 volume
             );
         }
+        // O que já tocou, em quadros do som: as voltas inteiras saem das repetições, e o resto é a
+        // posição dentro da volta em curso.
+        let quadros = sound.frames().max(1) as u64;
+        let tocados = desde_us.saturating_mul(u64::from(sound.rate)) / 1_000_000;
+        let voltas = u32::try_from(tocados / quadros).unwrap_or(u32::MAX);
         state.voices.insert(
             id,
             Voice {
-                tocados: 0.0,
+                tocados: tocados as f64,
                 descida: 0,
+                position: (tocados % quadros) as f64,
                 sound,
-                position: 0.0,
                 step,
                 volume,
                 remaining: match repeat {
                     0 => None,
-                    times => Some(times),
+                    times => Some(times.saturating_sub(voltas).max(1)),
                 },
                 paused: false,
                 done: false,
             },
         );
+    }
+
+    /// Cala todas as vozes e fecha todos os fluxos, de uma vez.
+    ///
+    /// É o que o save state restaurado pede: o que o mixer tocava era do instante de antes do
+    /// `Load`, e o jogo restaurado não sabe que aquilo existe — um som em laço ficaria tocando
+    /// para sempre, porque ninguém mais mandaria pará-lo.
+    pub fn para_tudo(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.voices.clear();
+            state.streams.clear();
+        }
     }
 
     /// Abre na voz `id` um fluxo de `rate` Hz e `channels` canais, vazio.
@@ -474,6 +532,39 @@ impl Mixer {
         }
     }
 
+    /// A velocidade do jogo, para o som andar junto com ele, e se o fast-forward o cala.
+    ///
+    /// **O som é puxado pelo relógio da placa, e não pelo do jogo.** A placa pede amostras no
+    /// ritmo do mundo; a 3x o jogo tocaria a música em 1x e entregaria os efeitos três vezes mais
+    /// juntos, e o fim de cada som — que o jogo mede pelo relógio virtual — chegaria antes de o
+    /// mixer tocá-lo inteiro. Multiplicar o passo de cada voz e de cada fluxo pela velocidade faz
+    /// o som acompanhar o jogo, mais agudo, como uma fita acelerada. Fora do fast-forward o
+    /// ritmo é exatamente 1, e nada muda. Ver `docs/implementacao/24-velocidade.md`.
+    pub fn define_avanco(&self, ritmo: f32, abafado: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.ritmo = f64::from(ritmo.clamp(0.1, 16.0));
+            state.abafado = abafado;
+        }
+    }
+
+    /// Para todo o som onde está, ou o solta: é a pausa da janela.
+    ///
+    /// **Pausar não é calar.** O mudo deixa o som correr, e o `set_paused` de uma voz é o jogo
+    /// pedindo; aqui é o jogo inteiro que para. O fim de cada som o jogo mede pelo relógio
+    /// virtual, que a pausa segura: com o mixer andando, a música seguia tocando com a imagem
+    /// parada, chegava ao fim durante a pausa, e na volta o jogo esperava um som que já tinha
+    /// acabado. Os fluxos já se calavam sozinhos, porque o jogo parado não os alimenta — por isso
+    /// o defeito só aparecia em alguns jogos.
+    ///
+    /// Entrar e sair passam por [`DESCIDA_FRAMES`] quadros de rampa, pelo motivo da descida de uma
+    /// voz: parar no meio da onda estala. Na entrada, o som anda esses quadros a mais; menos de
+    /// 2 ms, abaixo de qualquer diferença que o jogo meça.
+    pub fn congela(&self, congelado: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.congelado = congelado;
+        }
+    }
+
     /// Um mixer sem placa nenhuma, para gravar em arquivo o que sairia pelo alto-falante.
     ///
     /// Existe para poder **conferir** o som: sem isto, a única forma de saber se o áudio está
@@ -506,37 +597,41 @@ impl Mixer {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        let master = match state.muted {
+        let master = match state.muted || state.abafado {
             true => 0.0,
             false => state.master,
+        };
+        let ritmo = state.ritmo;
+        // Congelado, só andam os quadros que faltam da rampa; o resto fica onde está.
+        let vivos = match state.congelado {
+            true => frames.min(state.audivel as usize),
+            false => frames,
         };
         if master == 0.0 {
             // Mudo ainda consome as vozes: o som continua correndo, só não sai.
             for voice in state.voices.values_mut() {
                 if !voice.paused && !voice.done {
-                    for _ in 0..frames {
-                        voice.passo();
+                    for _ in 0..vivos {
+                        voice.passo(ritmo);
                     }
                 }
             }
             state.voices.retain(|_, voice| !voice.done);
             for stream in state.streams.values_mut() {
                 if !stream.paused {
-                    for _ in 0..frames {
-                        stream.next_frame();
+                    for _ in 0..vivos {
+                        stream.next_frame(ritmo);
                     }
                 }
             }
+            state.rampa_da_pausa(out, channels);
             return;
         }
         for voice in state.voices.values_mut() {
             if voice.paused || voice.done {
                 continue;
             }
-            // Mono alimenta os dois canais com a mesma amostra. Calcular duas vezes era o
-            // caminho geral, e na trilha (um canal, 22 kHz) isso é metade do laço.
-            let mono = voice.sound.channels <= 1;
-            for frame in out.chunks_mut(channels) {
+            for frame in out[..vivos * channels].chunks_mut(channels) {
                 if voice.done {
                     break;
                 }
@@ -555,7 +650,7 @@ impl Mixer {
                 }
                 // Depois de começar a descida, o som não avança mais: o que se ouve é o último
                 // valor, cada vez menor. Quando a descida acaba, a voz sai.
-                voice.passo();
+                voice.passo(ritmo);
             }
         }
         for stream in state.streams.values_mut() {
@@ -563,13 +658,14 @@ impl Mixer {
                 continue;
             }
             let gain = stream.volume * master;
-            for frame in out.chunks_mut(channels) {
-                let stereo = stream.next_frame();
+            for frame in out[..vivos * channels].chunks_mut(channels) {
+                let stereo = stream.next_frame(ritmo);
                 for (channel, slot) in frame.iter_mut().enumerate() {
                     *slot += stereo[channel.min(1)] * gain;
                 }
             }
         }
+        state.rampa_da_pausa(out, channels);
         // Somar vozes estoura a faixa; cortar é o que uma placa faria de qualquer forma, e é
         // melhor que deixar o valor dar a volta e virar estalo.
         for sample in out.iter_mut() {
@@ -676,8 +772,10 @@ impl Output {
                 device.build_output_stream(
                     &stream_config,
                     move |out: &mut [f32], _| {
-                        // A placa pediu: conta os quadros e, uma vez por segundo, diz que continua
-                        // viva. Ver [`PLACA_QUADROS`].
+                        // A placa pediu: conta os quadros e, a cada dez segundos, diz que continua
+                        // viva. Ver [`PLACA_QUADROS`]. Era uma vez por segundo, e numa sessão
+                        // gravada de 7 min isso deu 438 das 544 linhas do arquivo; dez segundos
+                        // ainda mostram quando o fluxo para, e casam com a linha `saude:`.
                         {
                             use std::sync::atomic::Ordering;
                             let quadros = (out.len() / channels.max(1)) as u64;
@@ -685,7 +783,7 @@ impl Output {
                                 PLACA_QUADROS.fetch_add(quadros, Ordering::Relaxed) + quadros;
                             let inicio = *PLACA_RELOGIO.get_or_init(std::time::Instant::now);
                             let agora = inicio.elapsed().as_millis() as u64;
-                            if agora >= PLACA_ULTIMO_MS.load(Ordering::Relaxed) + 1_000 {
+                            if agora >= PLACA_ULTIMO_MS.load(Ordering::Relaxed) + 10_000 {
                                 PLACA_ULTIMO_MS.store(agora, Ordering::Relaxed);
                                 crate::registro!(
                                     crate::registro::Nivel::Informacao,
@@ -809,6 +907,58 @@ mod tests {
         }
     }
 
+    /// Uma voz que começa do meio toca só o que falta, contando as repetições já tocadas. E o
+    /// "parar tudo" leva vozes e fluxos juntos.
+    #[test]
+    fn a_voz_comeca_do_meio_e_para_tudo_cala_tudo() {
+        let mixer = mixer(1_000);
+        // Um som de um segundo, três vezes, com 2,5 s já tocados: falta meio segundo.
+        mixer.play_desde(1, tone(1_000, 1_000), 1.0, 3, 2_500_000);
+        let mut total = 0usize;
+        while mixer.is_playing(1) && total < 10_000 {
+            let _ = mixer.render(50);
+            total += 50;
+        }
+        let esperado = 500 + DESCIDA_FRAMES as usize;
+        assert!(total.abs_diff(esperado) <= 50, "tocou {total} quadros, esperado {esperado}");
+
+        mixer.play(2, tone(1_000, 1_000), 1.0, 0);
+        mixer.open_stream(3, 1_000, 1, 1.0);
+        mixer.para_tudo();
+        assert!(!mixer.is_playing(2) && !mixer.is_playing(3));
+    }
+
+    /// A 3x a voz acaba na terça parte do tempo, que é quando o jogo — pelo relógio virtual —
+    /// acha que ela acabou. E o abafado do avanço cala sem parar a voz.
+    #[test]
+    fn no_avanco_a_voz_anda_na_velocidade_do_jogo() {
+        let quadros = 9_000usize;
+        let som = Arc::new(Sound {
+            samples: vec![0.5; quadros],
+            rate: 9_000,
+            channels: 1,
+        });
+        let mixer = mixer(9_000);
+        mixer.define_avanco(3.0, true);
+        mixer.play(4, som, 1.0, 1);
+        assert!(mixer.render(10).iter().all(|&s| s == 0.0), "abafado não soa");
+        let mut total = 10usize;
+        while mixer.is_playing(4) && total < 40_000 {
+            let _ = mixer.render(100);
+            total += 100;
+        }
+        let esperado = quadros / 3 + DESCIDA_FRAMES as usize;
+        assert!(
+            total.abs_diff(esperado) <= 100,
+            "tocou {total} quadros, esperado {esperado}"
+        );
+
+        // Fora do avanço, de volta a 1 e audível.
+        mixer.define_avanco(1.0, false);
+        mixer.play(5, tone(9_000, 100), 1.0, 1);
+        assert!(mixer.render(4).iter().all(|&s| s > 0.9));
+    }
+
     #[test]
     fn o_que_sai_do_mixer_volta_a_ser_um_wave() {
         // O despejo em arquivo é como se confere o som sem ouvi-lo, então a ida e a volta
@@ -901,6 +1051,53 @@ mod tests {
         mixer.set_paused(1, false);
         mixer.fill(&mut out, 2);
         assert!(out[0] > 0.0);
+    }
+
+    /// A pausa da janela para a música onde ela está, sem estalo na entrada nem na saída, e na
+    /// volta a música continua do mesmo ponto. Antes ela seguia tocando com a imagem parada.
+    #[test]
+    fn congelado_o_som_desce_para_e_volta_de_onde_parou() {
+        let quadros = 1_000usize;
+        let mixer = mixer(1_000);
+        mixer.play(1, tone(1_000, quadros), 1.0, 1);
+        let _ = mixer.render(100);
+        mixer.congela(true);
+        let descida = mixer.render(DESCIDA_FRAMES as usize);
+        let esquerda: Vec<f32> = descida.iter().step_by(2).copied().collect();
+        assert!(esquerda[0] > 0.9 && esquerda.windows(2).all(|par| par[1] <= par[0]));
+        assert_eq!(esquerda.last().copied(), Some(0.0));
+        // Parado, nem sai nem anda: um minuto inteiro não chega ao fim do som de um segundo.
+        assert!(mixer.render(60_000).iter().all(|&s| s == 0.0));
+        assert!(mixer.is_playing(1), "a música acabou durante a pausa");
+
+        mixer.congela(false);
+        let subida: Vec<f32> = mixer
+            .render(DESCIDA_FRAMES as usize)
+            .into_iter()
+            .step_by(2)
+            .collect();
+        assert!(subida[0] > 0.0 && subida[0] < 0.1, "{subida:?}");
+        assert!(subida.windows(2).all(|par| par[1] >= par[0]));
+        // Na volta sai o resto do som: o total menos os 100 quadros de antes da pausa. A rampa da
+        // entrada andou DESCIDA_FRAMES quadros, e a descida do fim do som soma outros tantos.
+        let mut total = DESCIDA_FRAMES as usize;
+        while mixer.is_playing(1) && total < 10_000 {
+            let _ = mixer.render(10);
+            total += 10;
+        }
+        let esperado = quadros - 100;
+        assert!(total.abs_diff(esperado) <= 10, "{total} contra {esperado}");
+    }
+
+    /// Mudo e pausado ao mesmo tempo, o som também fica parado: o mudo deixa correr, a pausa não.
+    #[test]
+    fn congelado_e_mudo_o_som_nao_anda() {
+        let mixer = mixer(8000);
+        mixer.play(1, tone(8000, 1_000), 1.0, 1);
+        mixer.set_master(1.0, true);
+        mixer.congela(true);
+        let _ = mixer.render(10_000);
+        assert!(mixer.is_playing(1));
     }
 
     #[test]

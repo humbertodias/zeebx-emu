@@ -28,11 +28,11 @@ FERRAMENTAS = [
 ]
 
 # O Qt 6 do `qt-standalone` entra junto: os `-dev` para compilar, e os módulos QML e o plugin do
-# Wayland para a janela abrir depois. O `egui-standalone` não precisa dele.
+# Wayland para a janela abrir depois. A linha de comando (`frontends/cli`) não precisa dele.
 PACOTES = {
     "debian": "sudo apt install build-essential cmake ninja-build pkg-config python3 libclang-dev libglib2.0-dev"
     " qt6-base-dev qt6-base-dev-tools qt6-declarative-dev qt6-declarative-dev-tools qmake6 qt6-wayland"
-    " qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts"
+    " qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-shapes"
     " qml6-module-qtquick-templates qml6-module-qtquick-window qml6-module-qtqml-workerscript",
     "arch": "sudo pacman -S --needed base-devel cmake ninja pkgconf python clang glib2"
     " qt6-base qt6-declarative qt6-wayland",
