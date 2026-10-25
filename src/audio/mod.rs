@@ -169,15 +169,15 @@ impl Voice {
     /// consumir a descida: sem isso a voz nunca chegaria ao fim ali, e o teste que cobra "o som
     /// andou até o fim" pegou exatamente isso.
     fn passo(&mut self, ritmo: f64) {
-        }
-            }
-                return;
-            if !self.sound.alcanca(quadro.saturating_add(1) * canais) {
+        if self.descida == 0 {
+            // Amostra que a síntese ainda não escreveu: ficar parado aqui. Avançar
+            // tocaria silêncio e, quando o buffer aparecesse, a música começaria no meio.
             let quadro = self.position.floor() as usize;
             let canais = (self.sound.channels as usize).max(1);
-        if self.descida == 0 {
-        // tocaria silêncio e, quando o buffer aparecesse, a música começaria no meio.
-        // Amostra que a síntese ainda não escreveu: ficar parado aqui. Avançar
+            if !self.sound.alcanca(quadro.saturating_add(1) * canais) {
+                return;
+            }
+        }
         match self.descida {
             0 => self.advance(ritmo),
             1 => {
@@ -631,6 +631,9 @@ impl Mixer {
             if voice.paused || voice.done {
                 continue;
             }
+            // Mono alimenta os dois canais com a mesma amostra. Calcular duas vezes era o
+            // caminho geral, e na trilha (um canal, 22 kHz) isso é metade do laço.
+            let mono = voice.sound.channels <= 1;
             for frame in out[..vivos * channels].chunks_mut(channels) {
                 if voice.done {
                     break;
