@@ -3986,11 +3986,7 @@ mod tests {
     /// estado diz que toca volta: o laço do começo, o efeito do ponto em que o relógio o deixou.
     #[test]
     fn restaurar_refaz_o_som_do_estado() {
-        let som = std::sync::Arc::new(crate::audio::wav::Sound {
-            rate: 1_000,
-            channels: 1,
-            samples: vec![0.5; 1_000],
-        });
+        let som = std::sync::Arc::new(crate::audio::wav::Sound::novo(1_000, 1, vec![0.5; 1_000]));
         let mut maquina = maquina();
         let mixer = crate::audio::Mixer::silent(1_000);
         maquina.set_audio(Some(mixer.clone()));

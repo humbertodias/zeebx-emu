@@ -28,6 +28,7 @@ frontends/
   ios/                    o aplicativo de iOS: UIKit por cima de uma biblioteca estática
   switch/                 o `.a` estático que o ROMBundler liga
   vita/                   o `.a` estático que o RetroArch da Vita liga
+  vita-standalone/        o VPK que abre sozinho, sem RetroArch
 ferramentas/        scripts Python: catálogo, varredura, instalação do core
 docs/               documentação; `patch-notes/` guarda as notas de cada versão
 assets/             ícones, fontes e `lang/` — os idiomas de fábrica
@@ -112,6 +113,11 @@ entrega OpenGL ES 3. No Mac a imagem Docker `vitasdk/vitasdk` traz o SDK; o job
 release faz o mesmo e publica `zeebx_libretro-vita.zip`. O `.a` não abre sozinho: o
 RetroArch o consome renomeado para `libretro_vita.a`.
 
+O aplicativo, que não passa pelo RetroArch, mora em
+[`frontends/vita-standalone`](frontends/vita-standalone/LEIAME.md). É um VPK: o mesmo alvo e a
+mesma imagem Docker, outro binário. O `vita.yml` é `workflow_dispatch`, como o APK; a release
+publica `zeebx-vita.zip`.
+
 **iOS** precisa de um Mac com Xcode e dos alvos `aarch64-apple-ios` e
 `aarch64-apple-ios-sim` no rustup. O passo a passo está em
 [`frontends/ios/LEIAME.md`](frontends/ios/LEIAME.md):
@@ -123,8 +129,8 @@ RetroArch o consome renomeado para `libretro_vita.a`.
 ## O CI
 
 **A tag é o único gatilho automático.** O `release.yml` dispara em `v0.0.0` e monta a release como
-rascunho. O `ci.yml`, o `libretro.yml`, o `headless.yml`, o `android.yml`, o `ios.yml` e o
-`qt.yml` são `workflow_dispatch`: o CI padrão compila a linha de comando — e com ela o núcleo e os
+rascunho. O `ci.yml`, o `libretro.yml`, o `headless.yml`, o `android.yml`, o `ios.yml`, o
+`vita.yml` e o `qt.yml` são `workflow_dispatch`: o CI padrão compila a linha de comando — e com ela o núcleo e os
 testes — nas seis plataformas e chama o `qt.yml`, que compila a interface e monta os instaladores. A release chama o mesmo `qt.yml`:
 os passos do Qt moram num lugar só. Onze jobs por execução é caro demais
 para gastar em cada push, e quem decide é quem pede. A exceção é o `discord-issues.yml`, que não

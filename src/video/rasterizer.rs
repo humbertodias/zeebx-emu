@@ -3094,8 +3094,25 @@ fn fill_band(tri: &Prepared, uniforms: &Uniforms, band: &mut Band) {
         // A interseção de um triângulo com a linha é um intervalo só: cada
         // aresta anda num sentido, e depois que o pixel sai não volta. Parar
         // ali não muda pixel nenhum — só deixa de percorrer o resto da caixa.
+        //
+        // A caixa ainda tem as duas pontas vazias. `faixa_dentro` corta o que
+        // já está do lado de fora, com folga de quatro pixels: o corte é uma
+        // divisão, e a soma iterada abaixo é a que o pixel de fato usa. Sem a
+        // folga, um arredondamento deixaria um pixel de fora.
+        let n = tri.max_x - tri.min_x;
+        let (corte_inicio, corte_fim) = faixa_dentro(&w, &tri.step, n);
+        // A folga não pode passar de zero: `0 - 4` viraria um x negativo, e o
+        // índice do pixel estoura.
+        let inicio = if corte_inicio > 4 { corte_inicio - 4 } else { 0 };
+        let fim = (corte_fim + 4).min(n).max(inicio);
+        if inicio >= fim {
+            continue;
+        }
+        for _ in 0..inicio {
+            w = [w[0] + tri.step[0], w[1] + tri.step[1], w[2] + tri.step[2]];
+        }
         let mut dentro = false;
-        for x in tri.min_x..tri.max_x {
+        for x in (tri.min_x + inicio)..(tri.min_x + fim) {
             let bary = w;
             // O passo vem antes do descarte porque o `continue` pularia a soma.
             w = [w[0] + tri.step[0], w[1] + tri.step[1], w[2] + tri.step[2]];
@@ -3267,6 +3284,48 @@ fn fill_band(tri: &Prepared, uniforms: &Uniforms, band: &mut Band) {
                 band.depth[index] = z;
             }
         }
+    }
+}
+
+/// Onde a linha pode cruzar o triângulo, em pixels a partir de `min_x`.
+///
+/// `w[i] + k * step[i] >= 0` para as três arestas. O resultado é apertado: quem
+/// chama abre uma folga, porque esta conta não é a soma pixel a pixel.
+fn faixa_dentro(w: &[f32; 3], step: &[f32; 3], n: i32) -> (i32, i32) {
+    if n <= 0 {
+        return (0, 0);
+    }
+    let mut inicio = 0i32;
+    let mut fim = n;
+    for i in 0..3 {
+        let (peso, passo) = (w[i], step[i]);
+        if passo == 0.0 {
+            if peso < 0.0 {
+                return (0, 0);
+            }
+            continue;
+        }
+        let cruzamento = -peso / passo;
+        // Fora da linha o corte encosta na borda. `as i32` de um float enorme não cabe.
+        let limitado = if !cruzamento.is_finite() || cruzamento >= n as f32 {
+            n as f32
+        } else if cruzamento <= 0.0 {
+            0.0
+        } else {
+            cruzamento
+        };
+        if passo > 0.0 {
+            inicio = inicio.max(limitado.ceil() as i32);
+        } else {
+            fim = fim.min(limitado.floor() as i32 + 1);
+        }
+    }
+    let inicio = inicio.clamp(0, n);
+    let fim = fim.clamp(0, n);
+    if inicio > fim {
+        (0, 0)
+    } else {
+        (inicio, fim)
     }
 }
 
@@ -3464,6 +3523,16 @@ fn unpack(color: [u8; 4]) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_faixa_corta_o_lado_de_fora_e_guarda_o_de_dentro() {
+        // Peso que entra no pixel 10 e sai no 20. step positivo no primeiro,
+        // negativo no segundo, o terceiro sempre dentro.
+        let w = [-5.0, 10.0, 1.0];
+        let step = [0.5, -0.5, 0.0];
+        assert_eq!(super::faixa_dentro(&w, &step, 40), (10, 21));
+        assert_eq!(super::faixa_dentro(&[-1.0, 1.0, 1.0], &[0.0, 0.0, 0.0], 8), (0, 0));
+    }
 
     /// **Uma linha horizontal pinta uma fileira, e só uma.** É o que o degradê do menu do Peggle
     /// pede: uma linha por pixel, lado a lado. Com duas fileiras por linha, a de cima cobriria a
