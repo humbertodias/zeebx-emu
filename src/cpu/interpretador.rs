@@ -1935,4 +1935,53 @@ mod tests {
         assert_eq!(cpu.run(0, 10).unwrap(), StopReason::Returned);
         assert_eq!(cpu.read_reg(Reg::R1), 0);
     }
+
+    #[test]
+    fn laco_arm_soma_dez_e_o_salto_nao_tomado_cai_no_retorno() {
+        // mov r0, #0; add r0, #1; cmp r0, #10; bne add; bx lr
+        let mut cpu = cpu_with(&arm(&[
+            0xe3a0_0000,
+            0xe280_0001,
+            0xe350_000a,
+            0x1aff_fffc,
+            0xe12f_ff1e,
+        ]));
+        cpu.write_reg(Reg::Lr, RETURN_MAGIC);
+        assert_eq!(cpu.run(0, 40).unwrap(), StopReason::Returned);
+        assert_eq!(cpu.read_reg(Reg::R0), 10);
+    }
+
+    #[test]
+    fn laco_arm_incrementa_a_palavra_na_memoria() {
+        // r1 = 0x1000; repete r0 vezes: ldr r2, [r1]; add r2, #1; str r2, [r1]; subs r0, #1; bne
+        let mut cpu = cpu_with(&arm(&[
+            0xe3a0_1a01,
+            0xe591_2000,
+            0xe282_2001,
+            0xe581_2000,
+            0xe250_0001,
+            0x1aff_fffa,
+            0xe12f_ff1e,
+        ]));
+        cpu.write_reg(Reg::R0, 4);
+        cpu.write_reg(Reg::Lr, RETURN_MAGIC);
+        cpu.write_mem(0x1000, &0u32.to_le_bytes()).unwrap();
+        assert_eq!(cpu.run(0, 40).unwrap(), StopReason::Returned);
+        let mut buf = [0u8; 4];
+        cpu.read_mem(0x1000, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 4);
+        assert_eq!(cpu.read_reg(Reg::R0), 0);
+    }
+
+    #[test]
+    fn laco_thumb_soma_dez() {
+        // movs r0, #0; adds r0, #1; cmp r0, #10; bne adds; bx lr
+        let code = [
+            0x00, 0x20, 0x01, 0x30, 0x0a, 0x28, 0xfc, 0xd1, 0x70, 0x47,
+        ];
+        let mut cpu = cpu_with(&code);
+        cpu.write_reg(Reg::Lr, RETURN_MAGIC | 1);
+        assert_eq!(cpu.run(1, 40).unwrap(), StopReason::Returned);
+        assert_eq!(cpu.read_reg(Reg::R0), 10);
+    }
 }

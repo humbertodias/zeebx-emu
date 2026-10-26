@@ -25,17 +25,21 @@ use crate::som::{self, Anel};
 const RAIZ: &str = "ux0:data/zeebx";
 const ROMS: &str = "ux0:data/zeebx/roms";
 const LOG: &str = "ux0:data/zeebx/zeebx.log";
+const LOG_C: &[u8] = b"ux0:data/zeebx/zeebx.log\0";
 
 const LARGURA: usize = 960;
 const ALTURA: usize = 544;
 const PASSO: usize = 960;
-const ALINHAMENTO: u32 = 256 * 1024;
+/// Um quadro de 960×544 em 32 bits cabe em 2 MiB. O `PHYCONT` sem cache só existe em múltiplos
+/// de 1 MiB; a CDRAM, em múltiplos de 256 KiB. 2 MiB serve para os dois.
+const ALINHAMENTO: u32 = 1024 * 1024;
 
-/// Memória do scanout, fisicamente contínua e sem cache. A CDRAM não cabe dois quadros de
-/// 960×544. A CPU não pinta aqui: cada store sem cache atravessa o barramento, e encher este
-/// quadro — mais o preto em volta — era um quadro inteiro só de escrita. O desenho vai para
-/// `Tela::composto`, com cache, e o `sceDmacMemcpy` entrega.
+/// Scanout fisicamente contínuo e sem cache. A CPU não pinta aqui: cada store sem cache
+/// atravessa o barramento. O desenho vai para `Tela::composto`, com cache, e o `sceDmacMemcpy`
+/// entrega.
 const MEMORIA_DA_TELA: u32 = 0x0D80_8060;
+/// Onde o quadro da Vita costuma morar. Neste aparelho há 112 MiB livres.
+const CDRAM_RW: u32 = 0x0940_8060;
 
 /// 1×, e o pulo automático de desenho quando a sessão mede atraso.
 ///
@@ -50,8 +54,11 @@ const RITMO: Ritmo = Ritmo {
     abafa_o_som: false,
 };
 
-/// O newlib lê este símbolo para dimensionar o `malloc`. 192 MiB cabem no modo estendido que o
-/// `ATTRIBUTE2=12` do `param.sfo` pede, e ainda sobra o quadro, o sqlite e o cache de som.
+/// O newlib lê este símbolo para dimensionar o `malloc`. O bloco é pedido uma vez e não cresce.
+/// 192 MiB cabem no modo estendido que o `ATTRIBUTE2=12` do `param.sfo` pede (365 MiB de MAIN).
+///
+/// O que passa de 1 MiB não mora aqui: o heap do guest sozinho tem 64 MiB, e o Double Dragon
+/// morreu com `sem memoria` com este número. Esses blocos saem por [`Grandes`].
 ///
 /// Nada neste binário lê o valor: o `#[used]` impede o LLVM de apagar o símbolo, e o `-Wl,-u` do
 /// `build.rs` impede o `--gc-sections` de apagá-lo de novo. `#[used(linker)]` faria os dois, e
@@ -62,6 +69,7 @@ const RITMO: Ritmo = Ritmo {
 pub static _newlib_heap_size_user: u32 = 192 * 1024 * 1024;
 
 #[repr(C)]
+#[allow(dead_code)]
 struct SceKernelAllocMemBlockOpt {
     size: u32,
     attr: u32,
@@ -109,6 +117,8 @@ unsafe extern "C" {
         opt: *mut SceKernelAllocMemBlockOpt,
     ) -> i32;
     fn sceKernelGetMemBlockBase(uid: i32, base: *mut *mut c_void) -> i32;
+    fn sceKernelFreeMemBlock(uid: i32) -> i32;
+    fn sceKernelGetFreeMemorySize(info: *mut Livre) -> i32;
     fn sceKernelExitProcess(res: i32) -> i32;
     fn sceDmacMemcpy(dst: *mut c_void, src: *const c_void, size: u32) -> i32;
     fn scePowerGetArmClockFrequency() -> i32;
@@ -135,6 +145,188 @@ const _: () = assert!(cfg!(target_pointer_width = "32"));
 fn morre(codigo: i32) -> ! {
     unsafe { sceKernelExitProcess(codigo) };
     loop {}
+}
+
+fn sem_memoria(layout: std::alloc::Layout) {
+    // Sem `std::fs`: o gancho roda porque uma alocação já falhou, e abrir o arquivo pelo Rust
+    // alocaria de novo. O `open` do newlib, se não couber, devolve erro em vez de reentrar aqui.
+    // O número é o tamanho que não coube, para o próximo log não dizer só "acabou".
+    let mut msg = [0u8; 48];
+    let prefixo = b"sem memoria ";
+    msg[..prefixo.len()].copy_from_slice(prefixo);
+    let mut n = layout.size();
+    let mut digitos = [0u8; 20];
+    let mut i = 0usize;
+    if n == 0 {
+        digitos[0] = b'0';
+        i = 1;
+    } else {
+        while n > 0 && i < digitos.len() {
+            digitos[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            i += 1;
+        }
+    }
+    let mut p = prefixo.len();
+    while i > 0 {
+        i -= 1;
+        msg[p] = digitos[i];
+        p += 1;
+    }
+    msg[p] = b'\n';
+    p += 1;
+    unsafe {
+        let fd = open(LOG_C.as_ptr().cast(), 1 | 0x8 | 0x200, 0o644i32);
+        if fd >= 0 {
+            write(fd, msg.as_ptr().cast(), p);
+            close(fd);
+        }
+    }
+}
+
+#[repr(C)]
+struct Livre {
+    size: i32,
+    user: i32,
+    cdram: i32,
+    phycont: i32,
+}
+
+fn anota_livre() {
+    let mut info = Livre {
+        size: std::mem::size_of::<Livre>() as i32,
+        user: 0,
+        cdram: 0,
+        phycont: 0,
+    };
+    let rc = unsafe { sceKernelGetFreeMemorySize(&mut info) };
+    if rc < 0 {
+        anota(&format!("livre recusado ({rc})"));
+        return;
+    }
+    anota(&format!(
+        "livre user {} cdram {} phycont {}",
+        info.user, info.cdram, info.phycont
+    ));
+}
+
+const BLOCOS: usize = 256;
+const PAGINA: usize = 256 * 1024;
+/// `SCE_KERNEL_MEMBLOCK_TYPE_USER_RW`. Cacheada: o interpretador lê isto o tempo todo.
+/// O quadro na tela usa outro tipo, sem cache, porque o display lê por DMA.
+const USER_RW: u32 = 0x0c20_d060;
+const NOME_DO_BLOCO: &[u8] = b"zeebx\0";
+
+#[derive(Clone, Copy)]
+struct Vaga {
+    ptr: usize,
+    uid: i32,
+}
+
+/// Alocações de 1 MiB ou mais, fora do heap fixo do newlib.
+///
+/// O heap de 192 MiB é pedido inteiro na largada e não devolve o que sobra ao sistema. O mapa
+/// do guest (64 MiB de heap, 8 de superfície, 4 de objetos) cabe nele e deixa pouco contíguo
+/// para a textura e para o som. Cada bloco grande pede a sua memória ao kernel; o `malloc`
+/// fica com o que é pequeno. Se o kernel recusar, cai no `malloc` como antes.
+pub struct Grandes {
+    trava: std::sync::atomic::AtomicBool,
+    vagas: std::cell::UnsafeCell<[Vaga; BLOCOS]>,
+}
+
+unsafe impl Sync for Grandes {}
+
+impl Grandes {
+    pub const NOVO: Self = Self {
+        trava: std::sync::atomic::AtomicBool::new(false),
+        vagas: std::cell::UnsafeCell::new([Vaga { ptr: 0, uid: 0 }; BLOCOS]),
+    };
+
+    fn trava(&self) {
+        while self
+            .trava
+            .swap(true, std::sync::atomic::Ordering::Acquire)
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn solta(&self) {
+        self.trava
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn bloco(&self, tamanho: u32) -> Option<*mut u8> {
+        let uid = unsafe {
+            sceKernelAllocMemBlock(NOME_DO_BLOCO.as_ptr().cast(), USER_RW, tamanho, std::ptr::null_mut())
+        };
+        if uid < 0 {
+            return None;
+        }
+        let mut base: *mut c_void = std::ptr::null_mut();
+        if unsafe { sceKernelGetMemBlockBase(uid, &mut base) } < 0 || base.is_null() {
+            unsafe { sceKernelFreeMemBlock(uid) };
+            return None;
+        }
+        self.trava();
+        let vagas = unsafe { &mut *self.vagas.get() };
+        let vaga = vagas.iter_mut().find(|vaga| vaga.ptr == 0);
+        let Some(vaga) = vaga else {
+            self.solta();
+            unsafe { sceKernelFreeMemBlock(uid) };
+            return None;
+        };
+        vaga.ptr = base as usize;
+        vaga.uid = uid;
+        self.solta();
+        Some(base.cast())
+    }
+
+    fn solta_bloco(&self, ptr: *mut u8) -> bool {
+        self.trava();
+        let vagas = unsafe { &mut *self.vagas.get() };
+        let Some(vaga) = vagas.iter_mut().find(|vaga| vaga.ptr == ptr as usize) else {
+            self.solta();
+            return false;
+        };
+        let uid = vaga.uid;
+        vaga.ptr = 0;
+        vaga.uid = 0;
+        self.solta();
+        unsafe { sceKernelFreeMemBlock(uid) };
+        true
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for Grandes {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() >= 1024 * 1024
+            && layout.align() <= PAGINA
+            && let Some(tamanho) = arredonda(layout.size())
+            && let Some(ptr) = self.bloco(tamanho)
+        {
+            return ptr;
+        }
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if self.solta_bloco(ptr) {
+            return;
+        }
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+fn arredonda(n: usize) -> Option<u32> {
+    let cheio = n.checked_add(PAGINA - 1)?;
+    u32::try_from(cheio & !(PAGINA - 1)).ok()
+}
+
+unsafe extern "C" {
+    fn open(path: *const c_char, flags: i32, ...) -> i32;
+    fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
+    fn close(fd: i32) -> i32;
 }
 
 fn anota(texto: &str) {
@@ -251,24 +443,34 @@ fn composto_alinhado(palavras: usize) -> (Vec<u32>, usize) {
     (composto, falta / 4)
 }
 
+fn pede_tela(tipo: u32, tamanho: u32) -> Result<i32, i32> {
+    // Sem o `opt`. Pedir alinhamento na estrutura (`attr` 0x4) devolve
+    // `0x80020005` no aparelho, com 256 KiB e com 1 MiB. O Vita3K aceita a
+    // estrutura. O kernel já alinha o bloco pelo tipo quando o ponteiro é nulo.
+    let uid = unsafe {
+        sceKernelAllocMemBlock(c"zeebx-fb".as_ptr(), tipo, tamanho, std::ptr::null_mut())
+    };
+    if uid < 0 { Err(uid) } else { Ok(uid) }
+}
+
 impl Tela {
     fn abre() -> Result<Self, String> {
         let bytes = ((PASSO * ALTURA * 4) as u32).div_ceil(ALINHAMENTO) * ALINHAMENTO;
-        let mut opt = SceKernelAllocMemBlockOpt {
-            size: std::mem::size_of::<SceKernelAllocMemBlockOpt>() as u32,
-            attr: 0x4,
-            alignment: ALINHAMENTO,
-            uid_base: 0,
-            nome: std::ptr::null(),
-            flags: 0,
-            reserved: [0; 10],
+        let tamanho = bytes * 2;
+        let uid = match pede_tela(MEMORIA_DA_TELA, tamanho) {
+            Ok(uid) => uid,
+            Err(phy) => match pede_tela(CDRAM_RW, tamanho) {
+                Ok(uid) => {
+                    anota(&format!("tela na cdram; phycont recusada ({phy})"));
+                    uid
+                }
+                Err(cdram) => {
+                    return Err(format!(
+                        "não consegui a memória da tela (phycont {phy}, cdram {cdram})"
+                    ));
+                }
+            },
         };
-        let uid = unsafe {
-            sceKernelAllocMemBlock(c"zeebx-fb".as_ptr(), MEMORIA_DA_TELA, bytes * 2, &mut opt)
-        };
-        if uid < 0 {
-            return Err(format!("não consegui a memória da tela ({uid})"));
-        }
         let mut base: *mut c_void = std::ptr::null_mut();
         let rc = unsafe { sceKernelGetMemBlockBase(uid, &mut base) };
         if rc < 0 || base.is_null() {
@@ -368,11 +570,18 @@ fn fio_de_som(porta: i32, anel: Arc<Anel>) {
     ajusta_prioridade();
     // Dois blocos: a porta lê o que acabou de receber até a chamada seguinte voltar. Encher o
     // mesmo bloco de novo, antes disso, troca o som que ainda está tocando.
-    let mut blocos = [[0i16; som::GRAO * 2]; 2];
+    let mut blocos = [
+        som::Bloco {
+            amostras: [0; som::GRAO * 2],
+        },
+        som::Bloco {
+            amostras: [0; som::GRAO * 2],
+        },
+    ];
     let mut qual = 0;
     loop {
-        anel.puxa(&mut blocos[qual]);
-        let rc = unsafe { sceAudioOutOutput(porta, blocos[qual].as_ptr().cast()) };
+        anel.puxa(&mut blocos[qual].amostras);
+        let rc = unsafe { sceAudioOutOutput(porta, blocos[qual].amostras.as_ptr().cast()) };
         if rc < 0 {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -746,12 +955,16 @@ pub fn roda() -> ! {
             let _ = writeln!(arquivo, "pânico: {info}");
         }
     }));
+    // Falta de memória aborta sem passar pelo pânico. O gancho é `fn`, não closure: no meio
+    // de uma alocação recusada ele não pode capturar nada.
+    std::alloc::set_alloc_error_hook(sem_memoria);
     unsafe { std::env::set_var("HOME", RAIZ) };
     zeebx::registro::le_do_ambiente();
     // 8 MiB de som já decodificado, o teto do perfil Portátil. Acima disso o cache compete com
     // o jogo pela RAM do aparelho.
     zeebx::machine::define_teto_do_cache_de_som(8 * 1024 * 1024);
     anota("Zeebx");
+    anota_livre();
 
     let mut tela = match Tela::abre() {
         Ok(tela) => tela,

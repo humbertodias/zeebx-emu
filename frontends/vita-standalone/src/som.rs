@@ -10,6 +10,16 @@ use std::sync::{Mutex, MutexGuard};
 /// Amostras por chamada da porta MAIN. Tem de ser múltiplo de 64, que é o `SCE_AUDIO_MIN_LEN`.
 pub const GRAO: usize = 256;
 
+/// Um grão estéreo alinhado a 64 bytes.
+///
+/// A `sceAudioOutOutput` lê este endereço por DMA. Sem o alinhamento o kernel derruba o
+/// processo, e isso não passa pelo pânico do Rust: o log acaba na última linha que deu tempo
+/// de gravar.
+#[repr(C, align(64))]
+pub struct Bloco {
+    pub amostras: [i16; GRAO * 2],
+}
+
 /// A porta MAIN só aceita 48 kHz. O misturador entrega nesta taxa, e o aparelho não reamostra.
 pub const TAXA: u32 = 48_000;
 
@@ -99,5 +109,7 @@ mod tests {
     fn o_grao_e_multiplo_do_minimo_da_porta() {
         assert_eq!(GRAO % 64, 0);
         assert!(GRAO >= 64);
+        assert!(std::mem::align_of::<Bloco>() >= 64);
+        assert_eq!(std::mem::size_of::<Bloco>(), GRAO * 2 * 2);
     }
 }

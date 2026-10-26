@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "vita", feature(alloc_error_hook))]
 //! O Zeebx na PlayStation Vita, sem RetroArch.
 //!
 //! Quem emula é a [`zeebx::session::Session`]. Este binário é o que no core o frontend faria:
@@ -21,3 +22,7 @@ fn main() {
 
 #[cfg(target_os = "vita")]
 mod vita;
+
+#[cfg(target_os = "vita")]
+#[global_allocator]
+static ALOCADOR: vita::Grandes = vita::Grandes::NOVO;

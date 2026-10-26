@@ -2605,9 +2605,14 @@ impl GlState {
         }
 
         let rows = height.div_ceil(bands);
+        // Na Vita as threads nascem uma vez e ficam. Criá-las aqui, a cada quadro, pedia
+        // pilha ao kernel no meio do jogo: quando ele recusava, o `expect` abortava o
+        // processo. A faixa que não tem thread é pintada por quem chamou.
+        #[cfg(target_os = "vita")]
+        pinta_em_paralelo_vita(color, depth, stencil, jobs, triangles, textures, width, rows);
+        #[cfg(not(target_os = "vita"))]
         std::thread::scope(|scope| {
             let mut top = 0i32;
-            let mut indice = 0usize;
             for ((color, depth), stencil) in color
                 .chunks_mut(rows * width)
                 .zip(depth.chunks_mut(rows * width))
@@ -2616,38 +2621,11 @@ impl GlState {
                 let band_top = top;
                 top += (color.len() / width) as i32;
                 let textures = &*textures;
-                let nucleo = indice;
-                indice += 1;
-                let trabalho = move || {
-                    // Sem isto as três threads nascem com máscara 0 e o kernel
-                    // as deixa no núcleo de quem criou — o mesmo do interpretador.
-                    #[cfg(target_os = "vita")]
-                    afinidade_vita(nucleo);
-                    #[cfg(not(target_os = "vita"))]
-                    let _ = nucleo;
-                    let mut band = Band {
-                        top: band_top,
-                        color,
-                        depth,
-                        stencil,
-                    };
-                    for job in jobs {
-                        let uniforms = job.uniforms(textures, width);
-                        for tri in &triangles[job.first..job.last] {
-                            fill_band(tri, &uniforms, &mut band);
-                        }
-                    }
-                };
-                // A std pede 2 MiB de pilha. Na Vita cada `flush` cria as threads
-                // de novo, e 2 MiB vezes três é alocação do kernel a cada quadro
-                // desenhado. 128 KiB cabe no preenchimento, que não recursa.
-                #[cfg(target_os = "vita")]
-                std::thread::Builder::new()
-                    .stack_size(128 * 1024)
-                    .spawn_scoped(scope, trabalho)
-                    .expect("a Vita recusou a thread do preenchimento");
-                #[cfg(not(target_os = "vita"))]
-                scope.spawn(trabalho);
+                scope.spawn(move || {
+                    pinta_faixa(
+                        band_top, color, depth, stencil, jobs, triangles, textures, width,
+                    );
+                });
             }
         });
         pending.clear();
@@ -2858,6 +2836,256 @@ fn nucleos_do_preenchimento() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Pinta uma faixa inteira, na ordem em que o jogo desenhou.
+fn pinta_faixa(
+    top: i32,
+    color: &mut [[u8; 4]],
+    depth: &mut [f32],
+    stencil: &mut [u8],
+    jobs: &[Job],
+    triangles: &[Prepared],
+    textures: &HashMap<u32, Texture>,
+    width: usize,
+) {
+    let mut band = Band {
+        top,
+        color,
+        depth,
+        stencil,
+    };
+    for job in jobs {
+        let uniforms = job.uniforms(textures, width);
+        for tri in &triangles[job.first..job.last] {
+            fill_band(tri, &uniforms, &mut band);
+        }
+    }
+}
+
+/// Ponteiros de uma faixa. Só vale enquanto o quadro que os criou espera as threads.
+///
+/// `Send` porque a thread leva a faixa para outro núcleo. Quem escreve é só ela, na sua
+/// fatia; o quadro e as texturas ficam parados até ela terminar.
+#[cfg(target_os = "vita")]
+struct Fatia {
+    top: i32,
+    color: *mut [u8; 4],
+    color_len: usize,
+    depth: *mut f32,
+    depth_len: usize,
+    stencil: *mut u8,
+    stencil_len: usize,
+    jobs: *const Job,
+    jobs_len: usize,
+    triangles: *const Prepared,
+    triangles_len: usize,
+    textures: *const HashMap<u32, Texture>,
+    width: usize,
+}
+
+// SAFETY: ver o comentário de `Fatia`. A thread só lê a faixa que o quadro acabou de publicar.
+#[cfg(target_os = "vita")]
+unsafe impl Send for Fatia {}
+
+#[cfg(target_os = "vita")]
+fn executa_fatia(fatia: &Fatia) {
+    // SAFETY: a faixa foi montada com pedaços que não se sobrepõem, e o quadro não é lido de
+    // volta até todas as threads desta geração terminarem.
+    unsafe {
+        let color = std::slice::from_raw_parts_mut(fatia.color, fatia.color_len);
+        let depth = std::slice::from_raw_parts_mut(fatia.depth, fatia.depth_len);
+        let stencil = std::slice::from_raw_parts_mut(fatia.stencil, fatia.stencil_len);
+        let jobs = std::slice::from_raw_parts(fatia.jobs, fatia.jobs_len);
+        let triangles = std::slice::from_raw_parts(fatia.triangles, fatia.triangles_len);
+        let textures = &*fatia.textures;
+        pinta_faixa(
+            fatia.top,
+            color,
+            depth,
+            stencil,
+            jobs,
+            triangles,
+            textures,
+            fatia.width,
+        );
+    }
+}
+
+/// As três threads de preenchimento da Vita. Vivem o processo inteiro.
+#[cfg(target_os = "vita")]
+struct PoolVita {
+    estado: std::sync::Mutex<EstadoVita>,
+    acordar: std::sync::Condvar,
+    pronto: std::sync::Condvar,
+}
+
+#[cfg(target_os = "vita")]
+struct EstadoVita {
+    geracao: u64,
+    fatias: [Option<Fatia>; 3],
+    feitas: usize,
+    /// Qual índice de fato tem thread. Um buraco no meio não pode receber faixa: a thread
+    /// daquele índice não existe, e o quadro esperaria uma resposta que não vem.
+    vivo: [bool; 3],
+}
+
+#[cfg(target_os = "vita")]
+fn pool_vita() -> &'static PoolVita {
+    static POOL: std::sync::OnceLock<&'static PoolVita> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let pool: &'static PoolVita = Box::leak(Box::new(PoolVita {
+            estado: std::sync::Mutex::new(EstadoVita {
+                geracao: 0,
+                fatias: [None, None, None],
+                feitas: 0,
+                vivo: [false; 3],
+            }),
+            acordar: std::sync::Condvar::new(),
+            pronto: std::sync::Condvar::new(),
+        }));
+        let mut vivo = [false; 3];
+        for indice in 0..3 {
+            let pool = pool;
+            // 2 MiB é o que a std pedia. Cabe no preenchimento, e como a thread não morre
+            // no fim do quadro, o kernel aloca esta pilha uma vez só.
+            let criada = std::thread::Builder::new()
+                .name(format!("preenchimento-{indice}"))
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || trabalhador_vita(indice, pool));
+            vivo[indice] = criada.is_ok();
+        }
+        if vivo == [false; 3] {
+            crate::registro!(
+                crate::registro::Nivel::Aviso,
+                "gl",
+                "a Vita não abriu thread de preenchimento; o quadro fica na thread do jogo"
+            );
+        }
+        pool.estado
+            .lock()
+            .unwrap_or_else(|erro| erro.into_inner())
+            .vivo = vivo;
+        pool
+    })
+}
+
+#[cfg(target_os = "vita")]
+fn trabalhador_vita(indice: usize, pool: &'static PoolVita) {
+    afinidade_vita(indice);
+    let mut vista = 0u64;
+    loop {
+        let mut estado = pool
+            .estado
+            .lock()
+            .unwrap_or_else(|erro| erro.into_inner());
+        while estado.geracao == vista || estado.fatias[indice].is_none() {
+            estado = pool
+                .acordar
+                .wait(estado)
+                .unwrap_or_else(|erro| erro.into_inner());
+        }
+        vista = estado.geracao;
+        let fatia = estado.fatias[indice].take();
+        drop(estado);
+        if let Some(fatia) = fatia {
+            executa_fatia(&fatia);
+        }
+        let mut estado = pool
+            .estado
+            .lock()
+            .unwrap_or_else(|erro| erro.into_inner());
+        estado.feitas += 1;
+        pool.pronto.notify_one();
+    }
+}
+
+#[cfg(target_os = "vita")]
+fn pinta_em_paralelo_vita(
+    color: &mut [[u8; 4]],
+    depth: &mut [f32],
+    stencil: &mut [u8],
+    jobs: &[Job],
+    triangles: &[Prepared],
+    textures: &HashMap<u32, Texture>,
+    width: usize,
+    rows: usize,
+) {
+    let color_len = color.len();
+    let depth_len = depth.len();
+    let stencil_len = stencil.len();
+    let color = color.as_mut_ptr();
+    let depth = depth.as_mut_ptr();
+    let stencil = stencil.as_mut_ptr();
+    let passo = rows.saturating_mul(width);
+    let mut locais = Vec::new();
+    let mut offset = 0usize;
+    let mut top = 0i32;
+    while offset < color_len && offset < depth_len && offset < stencil_len {
+        let n = passo
+            .min(color_len - offset)
+            .min(depth_len - offset)
+            .min(stencil_len - offset);
+        if n == 0 {
+            break;
+        }
+        locais.push(Fatia {
+            top,
+            color: unsafe { color.add(offset) },
+            color_len: n,
+            depth: unsafe { depth.add(offset) },
+            depth_len: n,
+            stencil: unsafe { stencil.add(offset) },
+            stencil_len: n,
+            jobs: jobs.as_ptr(),
+            jobs_len: jobs.len(),
+            triangles: triangles.as_ptr(),
+            triangles_len: triangles.len(),
+            textures: std::ptr::from_ref(textures),
+            width,
+        });
+        top += (n / width) as i32;
+        offset += n;
+    }
+
+    let pool = pool_vita();
+    let mut estado = pool
+        .estado
+        .lock()
+        .unwrap_or_else(|erro| erro.into_inner());
+    let vivo = estado.vivo;
+    estado.feitas = 0;
+    let mut na_principal = Vec::new();
+    let mut enviadas = 0usize;
+    let mut faixas = locais.into_iter();
+    for indice in 0..3 {
+        if !vivo[indice] {
+            continue;
+        }
+        if let Some(fatia) = faixas.next() {
+            estado.fatias[indice] = Some(fatia);
+            enviadas += 1;
+        }
+    }
+    na_principal.extend(faixas);
+    estado.geracao = estado.geracao.wrapping_add(1);
+    pool.acordar.notify_all();
+    drop(estado);
+
+    for fatia in na_principal {
+        executa_fatia(&fatia);
+    }
+
+    let mut estado = pool
+        .estado
+        .lock()
+        .unwrap_or_else(|erro| erro.into_inner());
+    while estado.feitas < enviadas {
+        estado = pool
+            .pronto
+            .wait(estado)
+            .unwrap_or_else(|erro| erro.into_inner());
+    }
 }
 
 /// Põe a thread de preenchimento num núcleo de usuário da Vita.
@@ -3095,24 +3323,11 @@ fn fill_band(tri: &Prepared, uniforms: &Uniforms, band: &mut Band) {
         // aresta anda num sentido, e depois que o pixel sai não volta. Parar
         // ali não muda pixel nenhum — só deixa de percorrer o resto da caixa.
         //
-        // A caixa ainda tem as duas pontas vazias. `faixa_dentro` corta o que
-        // já está do lado de fora, com folga de quatro pixels: o corte é uma
-        // divisão, e a soma iterada abaixo é a que o pixel de fato usa. Sem a
-        // folga, um arredondamento deixaria um pixel de fora.
-        let n = tri.max_x - tri.min_x;
-        let (corte_inicio, corte_fim) = faixa_dentro(&w, &tri.step, n);
-        // A folga não pode passar de zero: `0 - 4` viraria um x negativo, e o
-        // índice do pixel estoura.
-        let inicio = if corte_inicio > 4 { corte_inicio - 4 } else { 0 };
-        let fim = (corte_fim + 4).min(n).max(inicio);
-        if inicio >= fim {
-            continue;
-        }
-        for _ in 0..inicio {
-            w = [w[0] + tri.step[0], w[1] + tri.step[1], w[2] + tri.step[2]];
-        }
+        // Cortar as pontas com uma divisão por linha foi medido no aparelho: o
+        // quadro foi de 9 para 6. A conta entrou neste laço, que já era o mais
+        // quente. A soma abaixo é o que fica.
         let mut dentro = false;
-        for x in (tri.min_x + inicio)..(tri.min_x + fim) {
+        for x in tri.min_x..tri.max_x {
             let bary = w;
             // O passo vem antes do descarte porque o `continue` pularia a soma.
             w = [w[0] + tri.step[0], w[1] + tri.step[1], w[2] + tri.step[2]];
@@ -3284,48 +3499,6 @@ fn fill_band(tri: &Prepared, uniforms: &Uniforms, band: &mut Band) {
                 band.depth[index] = z;
             }
         }
-    }
-}
-
-/// Onde a linha pode cruzar o triângulo, em pixels a partir de `min_x`.
-///
-/// `w[i] + k * step[i] >= 0` para as três arestas. O resultado é apertado: quem
-/// chama abre uma folga, porque esta conta não é a soma pixel a pixel.
-fn faixa_dentro(w: &[f32; 3], step: &[f32; 3], n: i32) -> (i32, i32) {
-    if n <= 0 {
-        return (0, 0);
-    }
-    let mut inicio = 0i32;
-    let mut fim = n;
-    for i in 0..3 {
-        let (peso, passo) = (w[i], step[i]);
-        if passo == 0.0 {
-            if peso < 0.0 {
-                return (0, 0);
-            }
-            continue;
-        }
-        let cruzamento = -peso / passo;
-        // Fora da linha o corte encosta na borda. `as i32` de um float enorme não cabe.
-        let limitado = if !cruzamento.is_finite() || cruzamento >= n as f32 {
-            n as f32
-        } else if cruzamento <= 0.0 {
-            0.0
-        } else {
-            cruzamento
-        };
-        if passo > 0.0 {
-            inicio = inicio.max(limitado.ceil() as i32);
-        } else {
-            fim = fim.min(limitado.floor() as i32 + 1);
-        }
-    }
-    let inicio = inicio.clamp(0, n);
-    let fim = fim.clamp(0, n);
-    if inicio > fim {
-        (0, 0)
-    } else {
-        (inicio, fim)
     }
 }
 
@@ -3523,16 +3696,6 @@ fn unpack(color: [u8; 4]) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn a_faixa_corta_o_lado_de_fora_e_guarda_o_de_dentro() {
-        // Peso que entra no pixel 10 e sai no 20. step positivo no primeiro,
-        // negativo no segundo, o terceiro sempre dentro.
-        let w = [-5.0, 10.0, 1.0];
-        let step = [0.5, -0.5, 0.0];
-        assert_eq!(super::faixa_dentro(&w, &step, 40), (10, 21));
-        assert_eq!(super::faixa_dentro(&[-1.0, 1.0, 1.0], &[0.0, 0.0, 0.0], 8), (0, 0));
-    }
 
     /// **Uma linha horizontal pinta uma fileira, e só uma.** É o que o degradê do menu do Peggle
     /// pede: uma linha por pixel, lado a lado. Com duas fileiras por linha, a de cima cobriria a

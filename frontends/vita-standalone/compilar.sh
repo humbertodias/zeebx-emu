@@ -80,6 +80,18 @@ compilar_local() {
 	# ATTRIBUTE2 é inteiro. 12 pede a memória estendida: é ela que cabe o heap de 192 MiB.
 	"${bin}/vita-mksfoex" -s TITLE_ID=ZEEB00001 -s APP_VER=00.43 -d ATTRIBUTE2=12 \
 		"Zeebx" "$tmp/param.sfo"
+	# O Vita de verdade recusa o VPK com 0x8010113D se o ícone ou o LiveArea não forem
+	# PNG de 256 cores (tipo 3, 8 bits). O Vita3K instala os mesmos arquivos em RGBA.
+	python3 - "$AQUI/bubble/icon0.png" "$AQUI/bubble/bg.png" "$AQUI/bubble/startup.png" <<'PY'
+import struct, sys
+for caminho in sys.argv[1:]:
+    with open(caminho, "rb") as f:
+        sig = f.read(8)
+        f.read(8)
+        w, h, bit, color = struct.unpack(">IIBB", f.read(10))
+    if sig != b"\x89PNG\r\n\x1a\n" or bit != 8 or color != 3:
+        raise SystemExit(f"{caminho} não é PNG de 256 cores ({w}x{h}, bits {bit}, tipo {color})")
+PY
 	"${bin}/vita-pack-vpk" -s "$tmp/param.sfo" -b "$tmp/eboot.bin" \
 		--add "$AQUI/bubble/icon0.png=sce_sys/icon0.png" \
 		--add "$AQUI/bubble/bg.png=sce_sys/livearea/contents/bg.png" \
