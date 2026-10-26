@@ -3,10 +3,11 @@
 #
 # Não é o core do RetroArch. Aquele continua em frontends/vita/compilar.sh e sai
 # como libzeebx_libretro.a. Este aqui é o aplicativo: eboot.bin, param.sfo e a
-# LiveArea. Vídeo, áudio e controle são do próprio binário — framebuffer em
-# A8B8G8R8, porta de som MAIN a 48 kHz, sceCtrl. O desenho fica no processador,
-# porque o vitaGL não entrega OpenGL ES 3, e o núcleo é o interpretador, porque
-# o dynarmic não emite ARMv7.
+# LiveArea. Vídeo, áudio e controle são do próprio binário — o vitaGL apresenta
+# a tela, a porta de som é a MAIN a 48 kHz, o controle é o sceCtrl. O
+# preenchimento vai para a placa; o vitaGL traduz OpenGL ES 2, e o shader do
+# núcleo tem essa versão. O núcleo é o interpretador, porque o dynarmic não
+# emite ARMv7.
 #
 # No Mac, a cadeia está na imagem Docker vitasdk/vitasdk (ela não traz rustc;
 # este script instala o stable no contêiner):
@@ -46,7 +47,9 @@ compilar_local() {
 	export CXX_${ALVO//-/_}="${bin}/arm-vita-eabi-g++"
 	export AR_${ALVO//-/_}="${bin}/arm-vita-eabi-gcc-ar"
 	export CARGO_TARGET_ARMV7_SONY_VITA_NEWLIBEABIHF_LINKER="${bin}/arm-vita-eabi-gcc"
-	export CARGO_TARGET_ARMV7_SONY_VITA_NEWLIBEABIHF_RUSTFLAGS="-C panic=abort"
+	# O laço de pixel é escalar. Sem o Cortex-A9 o rustc gera ARMv7 genérico e não
+	# usa o NEON que o aparelho tem; o gcc do vitasdk já aponta esse núcleo.
+	export CARGO_TARGET_ARMV7_SONY_VITA_NEWLIBEABIHF_RUSTFLAGS="-C panic=abort -C target-cpu=cortex-a9"
 	# O gcc do vitasdk já aponta o Cortex-A9. `-mword-relocations` é o que cabe
 	# num executável grande. `compat/` cobre o `sys/ioctl.h` que a newlib não traz
 	# e o sqlite inclui — o mesmo arranjo do core.

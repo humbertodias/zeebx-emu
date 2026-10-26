@@ -361,7 +361,8 @@ impl<C: CpuBackend> Machine<C> {
             "DepthMask" => self.gl.set_depth_mask(a[0] != 0),
             "DepthRangex" | "DepthRangef" => {
                 let fixo = name.ends_with('x');
-                self.gl.set_depth_range(escalar(a[0], fixo), escalar(a[1], fixo));
+                self.gl
+                    .set_depth_range(escalar(a[0], fixo), escalar(a[1], fixo));
             }
             "AlphaFuncx" | "AlphaFunc" => self.gl.set_alpha_func(a[0], number(a[1])),
             "CullFace" => self.gl.set_cull_face(a[0]),
@@ -571,8 +572,7 @@ impl<C: CpuBackend> Machine<C> {
                 let largura = if kind == gles::GL_UNSIGNED_BYTE { 1 } else { 2 };
                 // Com um buffer de índices ligado, `list` é deslocamento dentro dele — e aqui
                 // vale a ligação **corrente**, ao contrário dos vetores de vértice.
-                let bytes =
-                    self.bytes_do_vetor(self.gl_element_buffer, list, count * largura)?;
+                let bytes = self.bytes_do_vetor(self.gl_element_buffer, list, count * largura)?;
                 let indices: Vec<u32> = bytes
                     .chunks_exact(largura as usize)
                     .map(|c| {
@@ -1030,8 +1030,7 @@ impl<C: CpuBackend> Machine<C> {
         if extensao > TETO_DO_ARRAY || inicio + extensao > u32::MAX as u64 {
             return avulso(self);
         }
-        let Ok(bytes) = self.bytes_do_vetor(pointer.buffer, inicio as u32, extensao as u32)
-        else {
+        let Ok(bytes) = self.bytes_do_vetor(pointer.buffer, inicio as u32, extensao as u32) else {
             return avulso(self);
         };
         Ok(indices
@@ -1096,9 +1095,9 @@ impl<C: CpuBackend> Machine<C> {
             };
             out[i] = match pointer.kind {
                 gles::GL_FLOAT => f32::from_le_bytes([campo[0], campo[1], campo[2], campo[3]]),
-                gles::GL_FIXED => gles::fixed(u32::from_le_bytes([
-                    campo[0], campo[1], campo[2], campo[3],
-                ])),
+                gles::GL_FIXED => {
+                    gles::fixed(u32::from_le_bytes([campo[0], campo[1], campo[2], campo[3]]))
+                }
                 gles::GL_SHORT => i16::from_le_bytes([campo[0], campo[1]]) as f32,
                 gles::GL_UNSIGNED_SHORT => u16::from_le_bytes([campo[0], campo[1]]) as f32,
                 gles::GL_BYTE => campo[0] as i8 as f32,
@@ -1217,6 +1216,11 @@ impl<C: CpuBackend> Machine<C> {
     /// volta junto, a tela parecia intacta, e a janela mostrava a textura: preto. No rewind, que
     /// segura o jogo parado em cada ponto, a tela ficava preta do começo ao fim — medido no Magical
     /// Drop III e no Um Jogo de Ovos, pela placa. Até a próxima troca de buffer vale a tela.
+    /// A textura do quadro, para um frontend que apresenta na própria placa.
+    pub fn textura_do_quadro(&self) -> Option<u32> {
+        self.gl.textura_do_quadro()
+    }
+
     pub fn quadro_na_placa(&self) -> Option<crate::video::rasterizer::QuadroNaPlaca> {
         let intacta = !self.placa_sem_o_quadro
             && self.escritas_do_quadro_gl == Some(self.screen().escritas());
@@ -1228,7 +1232,11 @@ impl<C: CpuBackend> Machine<C> {
         let (w, h, rgba) = self.quadro_grande_rgba()?;
         let mut quadro = Framebuffer::new(w as u32, h as u32);
         for (i, p) in rgba.chunks_exact(4).enumerate() {
-            let cor = Rgb { r: p[0], g: p[1], b: p[2] };
+            let cor = Rgb {
+                r: p[0],
+                g: p[1],
+                b: p[2],
+            };
             quadro.set_pixel((i % w) as i32, (i / w) as i32, cor);
         }
         Some(quadro)

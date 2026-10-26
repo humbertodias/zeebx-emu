@@ -1,8 +1,11 @@
 //! O aparelho: framebuffer, controle, alto-falante e a pasta `ux0:`.
 //!
-//! O desenho fica no processador. O vitaGL não entrega OpenGL ES 3, que é o perfil que o
-//! rasterizador de placa pede, e o dynarmic não emite ARMv7 — o núcleo aqui é o interpretador,
-//! o mesmo corte do core estático.
+//! O preenchimento vai para a placa quando o vitaGL sobe. O vitaGL traduz OpenGL ES 2, e o
+//! shader do núcleo tem essa versão. Se ele não sobe, o quadro volta a ser o RGB565 pintado no
+//! framebuffer do kernel. O dynarmic não emite ARMv7 — o núcleo aqui é o interpretador.
+
+#[path = "placa.rs"]
+mod placa;
 
 use std::ffi::{c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -243,10 +246,7 @@ impl Grandes {
     };
 
     fn trava(&self) {
-        while self
-            .trava
-            .swap(true, std::sync::atomic::Ordering::Acquire)
-        {
+        while self.trava.swap(true, std::sync::atomic::Ordering::Acquire) {
             core::hint::spin_loop();
         }
     }
@@ -258,7 +258,12 @@ impl Grandes {
 
     fn bloco(&self, tamanho: u32) -> Option<*mut u8> {
         let uid = unsafe {
-            sceKernelAllocMemBlock(NOME_DO_BLOCO.as_ptr().cast(), USER_RW, tamanho, std::ptr::null_mut())
+            sceKernelAllocMemBlock(
+                NOME_DO_BLOCO.as_ptr().cast(),
+                USER_RW,
+                tamanho,
+                std::ptr::null_mut(),
+            )
         };
         if uid < 0 {
             return None;
@@ -434,6 +439,8 @@ struct Tela {
     altura: usize,
     ja_avisou: bool,
     ja_avisou_dma: bool,
+    /// O vitaGL tomou a tela. O composto sobe como textura; não há scanout do kernel.
+    na_placa: bool,
 }
 
 fn composto_alinhado(palavras: usize) -> (Vec<u32>, usize) {
@@ -454,7 +461,27 @@ fn pede_tela(tipo: u32, tamanho: u32) -> Result<i32, i32> {
 }
 
 impl Tela {
-    fn abre() -> Result<Self, String> {
+    fn abre(na_placa: bool) -> Result<Self, String> {
+        unsafe { sceCtrlSetSamplingMode(1) };
+        if na_placa {
+            let (composto, inicio) = composto_alinhado(PASSO * ALTURA);
+            let mut tela = Self {
+                base: std::ptr::null_mut(),
+                composto,
+                inicio,
+                indice: 0,
+                salto: 0,
+                largura: LARGURA,
+                passo: PASSO,
+                altura: ALTURA,
+                ja_avisou: false,
+                ja_avisou_dma: false,
+                na_placa: true,
+            };
+            tela.apresenta(|q| apresentacao::limpa(q, apresentacao::PRETO));
+            tela.apresenta(|q| apresentacao::limpa(q, apresentacao::PRETO));
+            return Ok(tela);
+        }
         let bytes = ((PASSO * ALTURA * 4) as u32).div_ceil(ALINHAMENTO) * ALINHAMENTO;
         let tamanho = bytes * 2;
         let uid = match pede_tela(MEMORIA_DA_TELA, tamanho) {
@@ -476,7 +503,6 @@ impl Tela {
         if rc < 0 || base.is_null() {
             return Err(format!("a memória da tela não tem endereço ({rc})"));
         }
-        unsafe { sceCtrlSetSamplingMode(1) };
         let (composto, inicio) = composto_alinhado(PASSO * ALTURA);
         let mut tela = Self {
             base: base.cast(),
@@ -489,6 +515,7 @@ impl Tela {
             altura: ALTURA,
             ja_avisou: false,
             ja_avisou_dma: false,
+            na_placa: false,
         };
         tela.apresenta(|q| apresentacao::limpa(q, apresentacao::PRETO));
         tela.apresenta(|q| apresentacao::limpa(q, apresentacao::PRETO));
@@ -507,6 +534,14 @@ impl Tela {
                 altura: self.altura,
             };
             desenha(&mut quadro);
+        }
+        if self.na_placa {
+            placa::mostra_rgba(
+                &self.composto[inicio..inicio + n],
+                self.largura as i32,
+                self.altura as i32,
+            );
+            return;
         }
         let deslocamento = self.indice * (self.salto / 4);
         let dst = unsafe { self.base.add(deslocamento) };
@@ -665,9 +700,14 @@ impl Aplicativo {
         som: &Som,
     ) -> Result<(), String> {
         let instalados = self.instalados.clone();
-        match Session::start_software_with_storage_installed_policy(
+        let contexto = placa::contexto();
+        let na_placa = contexto.is_some();
+        match Session::start_with_storage_installed_policy(
             caminho,
             zeebx::PORTAS_PADRAO,
+            None,
+            na_placa,
+            contexto,
             ZWheel::default(),
             &self.storage,
             &instalados,
@@ -815,6 +855,11 @@ impl Aplicativo {
                 if jogo.faixa_suja {
                     jogo.faixa_suja = false;
                     tela.apresenta(|q| apresentacao::limpa(q, apresentacao::PRETO));
+                    // A limpeza troca viewport e programa. O espelho da placa ainda acha que
+                    // o estado de antes está valendo, e o quadro seguinte sairia na tela inteira.
+                    if placa::ativa() {
+                        jogo.sessao.retoma_o_contexto();
+                    }
                 }
                 let intermediario = jogo.sessao.mostra_quadro_intermediario();
                 if !intermediario {
@@ -847,15 +892,26 @@ impl Aplicativo {
                     som.anel.empurra(&jogo.pcm);
                 }
                 if intermediario || passo == Step::Presented {
-                    tela.apresenta(|q| {
-                        let screen = jogo.sessao.screen();
-                        apresentacao::copia_rgb565(
-                            q,
-                            screen.pixels(),
-                            screen.width(),
-                            screen.height(),
-                        );
-                    });
+                    // A textura do destino, 1:1 no centro. Ler o quadro de volta para a CPU
+                    // jogaria fora o motivo de desenhar na placa.
+                    let textura = match placa::ativa() && !intermediario {
+                        true => jogo.sessao.textura_do_quadro(),
+                        false => None,
+                    };
+                    if let Some(id) = textura {
+                        placa::mostra_textura(id, 160, 32, 640, 480);
+                        jogo.sessao.retoma_o_contexto();
+                    } else {
+                        tela.apresenta(|q| {
+                            let screen = jogo.sessao.screen();
+                            apresentacao::copia_rgb565(
+                                q,
+                                screen.pixels(),
+                                screen.width(),
+                                screen.height(),
+                            );
+                        });
+                    }
                 } else if passo == Step::Ahead {
                     // Adiantado, a volta volta na hora. Sem esta espera o laço gira no vazio.
                     unsafe { sceDisplayWaitVblankStart() };
@@ -966,7 +1022,15 @@ pub fn roda() -> ! {
     anota("Zeebx");
     anota_livre();
 
-    let mut tela = match Tela::abre() {
+    let na_placa = match placa::abre() {
+        placa::Abertura::Pronta => true,
+        placa::Abertura::SemPlaca => false,
+        placa::Abertura::TomouATela(erro) => {
+            anota(&erro);
+            morre(1);
+        }
+    };
+    let mut tela = match Tela::abre(na_placa) {
         Ok(tela) => tela,
         Err(erro) => {
             anota(&erro);

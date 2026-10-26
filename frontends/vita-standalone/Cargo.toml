@@ -12,9 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 # Sem `desktop` e sem `audio`. O `audio` é o `cpal`, que não tem porta na Vita; o som sai pela
-# `sceAudioOut` daqui. Sem `gl`: o vitaGL não entrega OpenGL ES 3, e o quadro é o RGB565 do
-# rasterizador de processador, pintado no framebuffer do aparelho.
-zeebx = { path = "../..", default-features = false }
+# `sceAudioOut` daqui. `gl` traz o preenchimento na placa, sem glutin: o contexto é o do vitaGL.
+# `gpu` não entra — ela pede janela de desktop.
+zeebx = { path = "../..", default-features = false, features = ["gl"] }
+glow = "0.16"
 
 [build-dependencies]
 cc = "1.0"

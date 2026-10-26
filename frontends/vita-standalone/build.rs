@@ -55,4 +55,33 @@ fn main() {
     ] {
         println!("cargo:rustc-link-lib={lib}");
     }
+    // O vitaGL é estático e vem depois do nosso código: o linker é de uma passada. O C++ é
+    // dele (`__cxa_*`). O `vitashark` é o compilador de shader que o vitaGL chama (`shark_*`);
+    // o stub `SceShaccCg` só tem o `sceShaccCg*`, que o shark é quem usa.
+    //
+    // `SceDisplay` já entrou acima, pelo nosso `sceDisplaySetFrameBuf`. O vitaGL pede outras
+    // funções do mesmo stub (`sceDisplayWaitVblankStartMulti`), e a primeira passada não as
+    // viu. Repetir o stub puxa só o objeto que faltou: cada função mora no seu `.o`.
+    for lib in [
+        "vitaGL",
+        "vitashark",
+        // O `sceShaccCgExt*` não está no stub: é esta biblioteca estática. Ela
+        // aplica o patch pelo taiHEN, que o homebrew já tem carregado.
+        "SceShaccCgExt",
+        "taihen_stub",
+        "mathneon",
+        "stdc++",
+        "SceDisplay_stub",
+        "SceGxm_stub",
+        "SceShaccCg_stub",
+        "SceAppMgr_stub",
+        "SceCommonDialog_stub",
+        "SceRtc_stub",
+        "SceSysmodule_stub",
+        // O shark carrega o módulo do compilador. O specs já ligou este stub para o resto
+        // do processo; aqui ele só entra de novo se `sceKernelLoadStartModule` ainda faltar.
+        "SceLibKernel_stub",
+    ] {
+        println!("cargo:rustc-link-lib={lib}");
+    }
 }

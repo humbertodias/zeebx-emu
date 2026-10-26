@@ -5681,6 +5681,7 @@ name = "zeebx-vita"
 version = "0.4.3"
 dependencies = [
  "cc",
+ "glow",
  "zeebx",
 ]
 

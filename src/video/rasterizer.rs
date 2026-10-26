@@ -206,7 +206,12 @@ impl TexEnv {
     /// do `DOT3` para a multiplicação — o mapa de normais vezes o vetor da luz, que é azul-roxo —, e
     /// a água da primeira pista ficava dessa cor. No aparelho ela é marrom.
     pub fn define(&mut self, pname: u32, enumeracao: u32, numero: f32) {
-        let faixa = |base: u32| pname.checked_sub(base).filter(|&i| i < 3).map(|i| i as usize);
+        let faixa = |base: u32| {
+            pname
+                .checked_sub(base)
+                .filter(|&i| i < 3)
+                .map(|i| i as usize)
+        };
         match pname {
             gles::GL_COMBINE_RGB if funcao_do_combine(enumeracao, true) => {
                 self.combina[0] = enumeracao
@@ -506,6 +511,7 @@ impl Texture {
     /// `GL_CLAMP_TO_EDGE` prende no último texel e `GL_REPEAT` dá a volta. Tratar tudo como
     /// repetição faz a borda de uma textura presa aparecer do outro lado — é o serrilhado que
     /// surgia nas beiradas da pista do Crash.
+    #[inline]
     fn wrap(mode: u32, index: i32, size: usize) -> usize {
         let size = size as i32;
         // O caso comum é a coordenada já estar dentro da textura, e aí não há o que fazer —
@@ -595,6 +601,7 @@ impl Texture {
     }
 
     /// Amostra um nível, com ou sem interpolação entre texels vizinhos.
+    #[inline]
     fn sample_nivel(&self, u: f32, v: f32, nivel: usize, suave: bool) -> [f32; 4] {
         let (width, height, pixels) = self.nivel(nivel);
         if width == 0 || height == 0 {
@@ -832,6 +839,15 @@ pub trait Rasterizador {
     /// **No software não há o que fazer**: ele desenha em memória, e o quadro sai pelo
     /// [`Self::frame_rgb565`] de sempre. É o que permite ao mesmo motor servir aos dois caminhos.
     fn desenha_no_fbo(&mut self, _fbo: Option<u32>) {}
+
+    /// A textura do quadro na placa, quando ele não vai ser lido de volta pela CPU.
+    ///
+    /// O `v` zero dessa textura é o topo da cena: o shader de preenchimento inverte o Y para o
+    /// `glReadPixels` devolver as linhas na ordem da superfície de software. Quem desenha a
+    /// textura na tela precisa desfazer essa inversão. No software não há textura.
+    fn textura_do_quadro(&self) -> Option<u32> {
+        None
+    }
 
     /// O contexto volta ao motor depois de a janela pintar nele. Ver
     /// [`GpuState`](crate::video::gpu::GpuState). No software não há contexto.
@@ -1661,7 +1677,6 @@ impl GlState {
     pub fn unidade_ativa_desenha(&self) -> bool {
         self.active_unit < 2
     }
-
 
     /// Um parâmetro do `glFog*`. O que não conhecemos fica de fora em vez de virar lixo.
     pub fn set_fog(&mut self, pname: u32, valores: [f32; 4]) {
@@ -2609,7 +2624,9 @@ impl GlState {
         // pilha ao kernel no meio do jogo: quando ele recusava, o `expect` abortava o
         // processo. A faixa que não tem thread é pintada por quem chamou.
         #[cfg(target_os = "vita")]
-        pinta_em_paralelo_vita(color, depth, stencil, jobs, triangles, textures, width, rows);
+        pinta_em_paralelo_vita(
+            color, depth, stencil, jobs, triangles, textures, width, rows,
+        );
         #[cfg(not(target_os = "vita"))]
         std::thread::scope(|scope| {
             let mut top = 0i32;
@@ -2770,7 +2787,7 @@ impl GlState {
         self.sujo = false;
     }
 
-#[cfg(test)]
+    #[cfg(test)]
     pub fn present(&mut self, width: usize, height: usize) -> Vec<u16> {
         // Entregar o quadro é o ponto em que ele precisa estar pintado — quem pede o resultado
         // não tem por que saber que o desenho é acumulado.
@@ -2975,10 +2992,7 @@ fn trabalhador_vita(indice: usize, pool: &'static PoolVita) {
     afinidade_vita(indice);
     let mut vista = 0u64;
     loop {
-        let mut estado = pool
-            .estado
-            .lock()
-            .unwrap_or_else(|erro| erro.into_inner());
+        let mut estado = pool.estado.lock().unwrap_or_else(|erro| erro.into_inner());
         while estado.geracao == vista || estado.fatias[indice].is_none() {
             estado = pool
                 .acordar
@@ -2991,10 +3005,7 @@ fn trabalhador_vita(indice: usize, pool: &'static PoolVita) {
         if let Some(fatia) = fatia {
             executa_fatia(&fatia);
         }
-        let mut estado = pool
-            .estado
-            .lock()
-            .unwrap_or_else(|erro| erro.into_inner());
+        let mut estado = pool.estado.lock().unwrap_or_else(|erro| erro.into_inner());
         estado.feitas += 1;
         pool.pronto.notify_one();
     }
@@ -3049,10 +3060,7 @@ fn pinta_em_paralelo_vita(
     }
 
     let pool = pool_vita();
-    let mut estado = pool
-        .estado
-        .lock()
-        .unwrap_or_else(|erro| erro.into_inner());
+    let mut estado = pool.estado.lock().unwrap_or_else(|erro| erro.into_inner());
     let vivo = estado.vivo;
     estado.feitas = 0;
     let mut na_principal = Vec::new();
@@ -3076,10 +3084,7 @@ fn pinta_em_paralelo_vita(
         executa_fatia(&fatia);
     }
 
-    let mut estado = pool
-        .estado
-        .lock()
-        .unwrap_or_else(|erro| erro.into_inner());
+    let mut estado = pool.estado.lock().unwrap_or_else(|erro| erro.into_inner());
     while estado.feitas < enviadas {
         estado = pool
             .pronto
@@ -3303,8 +3308,446 @@ struct Band<'a> {
     stencil: &'a mut [u8],
 }
 
+/// Textura do nível zero, em inteiro. O caminho em ponto flutuante divide e multiplica cada
+/// canal por 255; no Cortex-A9 isso é o grosso do pixel. Contra `pack(sample_nivel)`, o pior
+/// canal medido no teste `a_amostra_inteira_nao_passa_de_dois_niveis` foi dois níveis.
+struct Texel<'a> {
+    pixels: &'a [[u8; 4]],
+    width: usize,
+    height: usize,
+    wrap: [u32; 2],
+    /// `GL_REPEAT` com lado potência de dois vira máscara. O resto paga a divisão de `wrap`.
+    pot: [bool; 2],
+    mask: [usize; 2],
+}
+
+impl<'a> Texel<'a> {
+    fn novo(texture: &'a Texture) -> Option<Self> {
+        let width = texture.width;
+        let height = texture.height;
+        if width == 0 || height == 0 || texture.pixels.len() < width.saturating_mul(height) {
+            return None;
+        }
+        let pot = [
+            texture.wrap[0] == gles::GL_REPEAT && width.is_power_of_two(),
+            texture.wrap[1] == gles::GL_REPEAT && height.is_power_of_two(),
+        ];
+        Some(Self {
+            pixels: &texture.pixels,
+            width,
+            height,
+            wrap: texture.wrap,
+            pot,
+            mask: [width - 1, height - 1],
+        })
+    }
+
+    #[inline(always)]
+    fn indice(&self, eixo: usize, valor: i32) -> usize {
+        let tamanho = if eixo == 0 { self.width } else { self.height };
+        if self.pot[eixo] {
+            return (valor as usize) & self.mask[eixo];
+        }
+        Texture::wrap(self.wrap[eixo], valor, tamanho)
+    }
+
+    #[inline(always)]
+    fn le(&self, x: i32, y: i32) -> [u8; 4] {
+        let (x, y) = (self.indice(0, x), self.indice(1, y));
+        // SAFETY: `indice` devolve `0..lado`, e `novo` exigiu pixels para a textura inteira.
+        unsafe { *self.pixels.get_unchecked(y * self.width + x) }
+    }
+
+    #[inline(always)]
+    fn pega<const SUAVE: bool>(&self, u: f32, v: f32) -> [u8; 4] {
+        let x = u * self.width as f32 - 0.5;
+        let y = v * self.height as f32 - 0.5;
+        if !SUAVE {
+            return self.le(x.round() as i32, y.round() as i32);
+        }
+        let (x0, y0) = (x.floor(), y.floor());
+        let fx = ((x - x0) * 256.0).clamp(0.0, 255.0) as u32;
+        let fy = ((y - y0) * 256.0).clamp(0.0, 255.0) as u32;
+        let (x0, y0) = (x0 as i32, y0 as i32);
+        let cantos = [
+            self.le(x0, y0),
+            self.le(x0 + 1, y0),
+            self.le(x0, y0 + 1),
+            self.le(x0 + 1, y0 + 1),
+        ];
+        let mut saida = [0u8; 4];
+        for canal in 0..4 {
+            let cima = u32::from(cantos[0][canal]) * (256 - fx) + u32::from(cantos[1][canal]) * fx;
+            let baixo = u32::from(cantos[2][canal]) * (256 - fx) + u32::from(cantos[3][canal]) * fx;
+            saida[canal] = ((cima * (256 - fy) + baixo * fy + 32_768) >> 16) as u8;
+        }
+        saida
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAMINHO_AFIM: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Quatro vértices no mesmo `1/w`: sprite e fundo 2D. A perspectiva por pixel é divisão à
+/// toa, e é ela que o laço opaco ainda fazia.
+fn afim(tri: &Prepared) -> Option<f32> {
+    let w = tri.screen[0][3];
+    if w == 0.0 {
+        return None;
+    }
+    let perto = |outro: f32| (outro - w).abs() <= 1.0e-5 * (1.0 + w.abs());
+    (perto(tri.screen[1][3]) && perto(tri.screen[2][3])).then_some(w)
+}
+
+fn cor_chapada(tri: &Prepared, w: f32) -> Option<[f32; 4]> {
+    let mut cor = [0.0; 4];
+    for canal in 0..4 {
+        let c0 = tri.over_w[0][canal] / w;
+        let c1 = tri.over_w[1][canal] / w;
+        let c2 = tri.over_w[2][canal] / w;
+        if (c0 - c1).abs() > 1.0e-4 || (c0 - c2).abs() > 1.0e-4 || !(0.0..=1.0).contains(&c0) {
+            return None;
+        }
+        cor[canal] = c0;
+    }
+    Some(cor)
+}
+
+/// `0` não mistura, `1` é `SRC_ALPHA` sobre `ONE_MINUS_SRC_ALPHA`, `2` é aditiva.
+fn mistura_rapida(uniforms: &Uniforms) -> Option<u8> {
+    if !uniforms.blend {
+        return Some(0);
+    }
+    if uniforms.blend_src != gles::GL_SRC_ALPHA {
+        return None;
+    }
+    if uniforms.blend_dst == gles::GL_ONE_MINUS_SRC_ALPHA {
+        Some(1)
+    } else if uniforms.blend_dst == gles::GL_ONE {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn aplica_cor(texel: [u8; 4], cor: [f32; 4]) -> [u8; 4] {
+    std::array::from_fn(|i| {
+        let v = cor[i] * f32::from(texel[i]) + 0.5;
+        if v <= 0.0 {
+            0
+        } else if v >= 255.0 {
+            255
+        } else {
+            v as u8
+        }
+    })
+}
+
+#[inline(always)]
+fn por_cima(src: [u8; 4], dst: [u8; 4], aditiva: bool) -> [u8; 4] {
+    let alfa = u32::from(src[3]);
+    std::array::from_fn(|i| {
+        let somado = if aditiva {
+            u32::from(src[i]) * alfa + u32::from(dst[i]) * 255
+        } else {
+            u32::from(src[i]) * alfa + u32::from(dst[i]) * (255 - alfa)
+        };
+        (somado.saturating_add(127) / 255).min(255) as u8
+    })
+}
+
+/// Preenchimento dos triângulos afins: uma textura, cor constante, sem névoa e sem stencil.
+///
+/// O corpo geral — e mesmo o atalho opaco — interpola perspectiva e amostra em ponto
+/// flutuante. Sprite com teste de alfa não entrava no atalho, e é o grosso de um jogo 2D.
+/// Aqui `u` e `v` andam um passo por pixel, a profundidade continua a conta exata a partir
+/// do vértice zero, e o texel é inteiro.
+///
+/// Medido neste Mac, em release, o mesmo quadro de 640×480 com textura linear e teste de
+/// profundidade, preenchido em paralelo: 2,22 ms no corpo geral, 1,09 ms no atalho opaco e
+/// 0,61 ms aqui. Não é um número da Vita.
+#[inline(never)]
+fn fill_afim<const SUAVE: bool>(
+    tri: &Prepared,
+    uniforms: &Uniforms,
+    band: &mut Band,
+    texel: &Texel<'_>,
+    w: f32,
+    cor: [f32; 4],
+    copia: bool,
+    mistura: u8,
+) {
+    #[cfg(test)]
+    CAMINHO_AFIM.with(|c| c.set(c.get() + 1));
+    let persp = 1.0 / w;
+    let derivada = |canal: usize| {
+        (tri.step[0] * tri.over_w[0][canal]
+            + tri.step[1] * tri.over_w[1][canal]
+            + tri.step[2] * tri.over_w[2][canal])
+            * persp
+    };
+    let (du, dv) = (derivada(4), derivada(5));
+    let (z0, dz1, dz2) = (
+        tri.screen[0][2],
+        tri.screen[1][2] - tri.screen[0][2],
+        tri.screen[2][2] - tri.screen[0][2],
+    );
+    let ou = [tri.over_w[0][4], tri.over_w[1][4], tri.over_w[2][4]];
+    let ov = [tri.over_w[0][5], tri.over_w[1][5], tri.over_w[2][5]];
+    let width = uniforms.width;
+    let rows = (band.color.len() / width) as i32;
+    let top = tri.min_y.max(band.top);
+    let bottom = tri.max_y.min(band.top + rows);
+    let depth_test = uniforms.depth_test;
+    let depth_func = uniforms.depth_func;
+    let grava_z = depth_test && uniforms.depth_mask;
+    let testa_alfa = uniforms.alpha_test;
+    let alfa_func = uniforms.alpha_func;
+    let alfa_ref = uniforms.alpha_ref;
+    let aditiva = mistura == 2;
+    for y in top..bottom {
+        let start = [tri.min_x as f32 + 0.5, y as f32 + 0.5, 0.0, 0.0];
+        let mut peso = [
+            edge(tri.screen[1], tri.screen[2], start) * tri.inv_area,
+            edge(tri.screen[2], tri.screen[0], start) * tri.inv_area,
+            edge(tri.screen[0], tri.screen[1], start) * tri.inv_area,
+        ];
+        let mut x = tri.min_x;
+        while x < tri.max_x && (peso[0] < 0.0 || peso[1] < 0.0 || peso[2] < 0.0) {
+            peso = [
+                peso[0] + tri.step[0],
+                peso[1] + tri.step[1],
+                peso[2] + tri.step[2],
+            ];
+            x += 1;
+        }
+        let row = (y - band.top) as usize * width;
+        let mut u = 0.0;
+        let mut v = 0.0;
+        let mut fase = 0u32;
+        while x < tri.max_x && peso[0] >= 0.0 && peso[1] >= 0.0 && peso[2] >= 0.0 {
+            // `u += du` ao longo da linha não é a conta do peso, em f32. De 32 em 32
+            // pixels a coordenada volta a sair do peso, e o desvio não atravessa a linha.
+            if fase == 0 {
+                u = (peso[0] * ou[0] + peso[1] * ou[1] + peso[2] * ou[2]) * persp;
+                v = (peso[0] * ov[0] + peso[1] * ov[1] + peso[2] * ov[2]) * persp;
+            }
+            let z = z0 + peso[1] * dz1 + peso[2] * dz2;
+            let index = row + x as usize;
+            let passa_z = !depth_test
+                || match depth_func {
+                    gles::GL_LESS => z < band.depth[index],
+                    gles::GL_LEQUAL => z <= band.depth[index],
+                    _ => true,
+                };
+            if passa_z {
+                let bruto = texel.pega::<SUAVE>(u, v);
+                let mut cor = if copia { bruto } else { aplica_cor(bruto, cor) };
+                let visivel =
+                    !testa_alfa || compare(alfa_func, f32::from(cor[3]) / 255.0, alfa_ref);
+                if visivel {
+                    if mistura != 0 {
+                        cor = por_cima(cor, band.color[index], aditiva);
+                    }
+                    band.color[index] = cor;
+                    if grava_z {
+                        band.depth[index] = z;
+                    }
+                }
+            }
+            u += du;
+            v += dv;
+            fase = (fase + 1) & 31;
+            peso = [
+                peso[0] + tri.step[0],
+                peso[1] + tri.step[1],
+                peso[2] + tri.step[2],
+            ];
+            x += 1;
+        }
+    }
+}
+
+/// O caminho afim, quando o triângulo e o estado cabem nele. Senão o chamador segue no
+/// preenchimento geral.
+fn fill_afim_se_couber(tri: &Prepared, uniforms: &Uniforms, band: &mut Band) -> bool {
+    let Some(texture) = uniforms.texture else {
+        return false;
+    };
+    if uniforms.usa_mipmap || uniforms.texture1.is_some() || uniforms.stencil.test {
+        return false;
+    }
+    if uniforms.fog.ligada && uniforms.fog.permitida {
+        return false;
+    }
+    if uniforms.color_mask != [true, true, true, true] {
+        return false;
+    }
+    if uniforms.depth_test
+        && !matches!(
+            uniforms.depth_func,
+            gles::GL_LESS | gles::GL_LEQUAL | gles::GL_ALWAYS
+        )
+    {
+        return false;
+    }
+    if matches!(
+        uniforms.texture_env.modo,
+        gles::GL_DECAL | gles::GL_ADD | gles::GL_COMBINE
+    ) {
+        return false;
+    }
+    let (Some(w), Some(mistura)) = (afim(tri), mistura_rapida(uniforms)) else {
+        return false;
+    };
+    let substitui = uniforms.texture_env.modo == gles::GL_REPLACE;
+    let Some(cor) = (if substitui {
+        Some([1.0; 4])
+    } else {
+        cor_chapada(tri, w)
+    }) else {
+        return false;
+    };
+    let Some(texel) = Texel::novo(texture) else {
+        return false;
+    };
+    let copia = substitui || cor.iter().all(|c| (*c - 1.0).abs() <= 1.0e-6);
+    if texture.filter == gles::GL_LINEAR {
+        fill_afim::<true>(tri, uniforms, band, &texel, w, cor, copia, mistura);
+    } else {
+        fill_afim::<false>(tri, uniforms, band, &texel, w, cor, copia, mistura);
+    }
+    true
+}
+
+/// O preenchimento comum: uma textura, sem névoa, sem mistura, sem stencil e sem teste de
+/// alfa. A função geral carrega tudo isso no mesmo corpo, e no Cortex-A9 da Vita o laço
+/// derrama registradores — o quadro desenhado no aparelho ficou em 95,5 ms contra 6,6 ms sem
+/// pintar.
+///
+/// A conta é a mesma. Medido neste Mac, em release, um quadro de 640×480 com textura linear
+/// e teste de profundidade: 2,22 ms no corpo geral e 1,09 ms aqui. Não é um número da Vita.
+fn serve_opaco(uniforms: &Uniforms) -> bool {
+    if uniforms.texture.is_none() || uniforms.usa_mipmap || uniforms.texture1.is_some() {
+        return false;
+    }
+    if uniforms.alpha_test || uniforms.blend || uniforms.stencil.test {
+        return false;
+    }
+    if uniforms.fog.ligada && uniforms.fog.permitida {
+        return false;
+    }
+    if uniforms.color_mask != [true, true, true, true] {
+        return false;
+    }
+    if uniforms.depth_test
+        && !matches!(
+            uniforms.depth_func,
+            gles::GL_LESS | gles::GL_LEQUAL | gles::GL_ALWAYS
+        )
+    {
+        return false;
+    }
+    !matches!(
+        uniforms.texture_env.modo,
+        gles::GL_DECAL | gles::GL_ADD | gles::GL_COMBINE
+    )
+}
+
+fn fill_opaco(tri: &Prepared, uniforms: &Uniforms, band: &mut Band) {
+    let Some(texture) = uniforms.texture else {
+        return;
+    };
+    let substitui = uniforms.texture_env.modo == gles::GL_REPLACE;
+    let suave = texture.filter == gles::GL_LINEAR;
+    let width = uniforms.width;
+    let rows = (band.color.len() / width) as i32;
+    let top = tri.min_y.max(band.top);
+    let bottom = tri.max_y.min(band.top + rows);
+    let depth_test = uniforms.depth_test;
+    let depth_func = uniforms.depth_func;
+    let grava_z = depth_test && uniforms.depth_mask;
+    for y in top..bottom {
+        let start = [tri.min_x as f32 + 0.5, y as f32 + 0.5, 0.0, 0.0];
+        let mut peso = [
+            edge(tri.screen[1], tri.screen[2], start) * tri.inv_area,
+            edge(tri.screen[2], tri.screen[0], start) * tri.inv_area,
+            edge(tri.screen[0], tri.screen[1], start) * tri.inv_area,
+        ];
+        let row = (y - band.top) as usize * width;
+        let mut dentro = false;
+        for x in tri.min_x..tri.max_x {
+            let bary = peso;
+            peso = [
+                peso[0] + tri.step[0],
+                peso[1] + tri.step[1],
+                peso[2] + tri.step[2],
+            ];
+            if bary[0] < 0.0 || bary[1] < 0.0 || bary[2] < 0.0 {
+                if dentro {
+                    break;
+                }
+                continue;
+            }
+            dentro = true;
+            let z = tri.screen[0][2]
+                + bary[1] * (tri.screen[1][2] - tri.screen[0][2])
+                + bary[2] * (tri.screen[2][2] - tri.screen[0][2]);
+            let index = row + x as usize;
+            if depth_test {
+                let passa = match depth_func {
+                    gles::GL_LESS => z < band.depth[index],
+                    gles::GL_LEQUAL => z <= band.depth[index],
+                    _ => true,
+                };
+                if !passa {
+                    continue;
+                }
+            }
+            let inv_w = bary[0] * tri.screen[0][3]
+                + bary[1] * tri.screen[1][3]
+                + bary[2] * tri.screen[2][3];
+            if inv_w == 0.0 {
+                continue;
+            }
+            let persp = 1.0 / inv_w;
+            let atr = |k: usize| {
+                (bary[0] * tri.over_w[0][k]
+                    + bary[1] * tri.over_w[1][k]
+                    + bary[2] * tri.over_w[2][k])
+                    * persp
+            };
+            let texel = texture.sample_nivel(atr(4), atr(5), 0, suave);
+            let cor = if substitui {
+                texel
+            } else {
+                [
+                    atr(0) * texel[0],
+                    atr(1) * texel[1],
+                    atr(2) * texel[2],
+                    atr(3) * texel[3],
+                ]
+            };
+            band.color[index] = pack(cor);
+            if grava_z {
+                band.depth[index] = z;
+            }
+        }
+    }
+}
+
 /// Preenche a parte de um triângulo que cai dentro da faixa.
 fn fill_band(tri: &Prepared, uniforms: &Uniforms, band: &mut Band) {
+    if fill_afim_se_couber(tri, uniforms, band) {
+        return;
+    }
+    if serve_opaco(uniforms) {
+        fill_opaco(tri, uniforms, band);
+        return;
+    }
     let width = uniforms.width;
     let rows = (band.color.len() / width) as i32;
     let top = tri.min_y.max(band.top);
@@ -3627,7 +4070,12 @@ pub(crate) fn linhas_em_triangulos(
             v.position[1] += sinal * oy * v.position[3];
             v
         };
-        let (a0, a1, b0, b1) = (desloca(a, 1.0), desloca(a, -1.0), desloca(b, 1.0), desloca(b, -1.0));
+        let (a0, a1, b0, b1) = (
+            desloca(a, 1.0),
+            desloca(a, -1.0),
+            desloca(b, 1.0),
+            desloca(b, -1.0),
+        );
         // `a1 → b1 → b0` gira no sentido de `(dx, dy)` para `(ox, oy)`, que é anti-horário.
         match ccw {
             true => saida.extend([a1, b1, b0, a1, b0, a0]),
@@ -3656,6 +4104,7 @@ fn clip_near(a: Vertex, b: Vertex) -> Vertex {
 }
 
 /// Uma das funções de comparação do OpenGL.
+#[inline]
 fn compare(func: u32, value: f32, reference: f32) -> bool {
     match func {
         gles::GL_NEVER => false,
@@ -3697,6 +4146,212 @@ fn unpack(color: [u8; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
 
+    /// Quadro cheio com uma textura linear, o caso que a Vita mede em dezenas de
+    /// milissegundos. Ignorado no CI: é relógio, não comportamento.
+    #[test]
+    #[ignore]
+    fn mede_o_preenchimento_de_um_quadro() {
+        let mut state = super::GlState::new(640, 480);
+        state.set_viewport(0, 0, 640, 480);
+        state.set_capability(super::gles::GL_DEPTH_TEST, true);
+        state.set_depth_func(super::gles::GL_LEQUAL);
+        state.clear(super::gles::GL_COLOR_BUFFER_BIT | super::gles::GL_DEPTH_BUFFER_BIT);
+        let mut pixels = vec![[0u8; 4]; 64 * 64];
+        for (i, p) in pixels.iter_mut().enumerate() {
+            *p = [(i % 64) as u8, (i / 64) as u8, 180, 255];
+        }
+        state.textures.insert(
+            1,
+            super::Texture {
+                width: 64,
+                height: 64,
+                pixels,
+                filter: super::gles::GL_LINEAR,
+                min_filter: super::gles::GL_LINEAR,
+                ..super::Texture::default()
+            },
+        );
+        state.bind_texture(1);
+        state.set_capability(super::gles::GL_TEXTURE_2D, true);
+        let v = |x: f32, y: f32, u: f32, t: f32| super::Vertex {
+            position: [x, y, 0.0, 1.0],
+            uv: [u, t, 0.0, 1.0],
+            ..Default::default()
+        };
+        let desenha = |state: &mut super::GlState| {
+            state.draw(
+                super::gles::GL_TRIANGLES,
+                &[
+                    v(-1.0, -1.0, 0.0, 0.0),
+                    v(1.0, -1.0, 1.0, 0.0),
+                    v(1.0, 1.0, 1.0, 1.0),
+                    v(-1.0, -1.0, 0.0, 0.0),
+                    v(1.0, 1.0, 1.0, 1.0),
+                    v(-1.0, 1.0, 0.0, 1.0),
+                ],
+            );
+        };
+        desenha(&mut state);
+        state.flush();
+        let comeco = std::time::Instant::now();
+        for _ in 0..4 {
+            desenha(&mut state);
+            state.flush();
+        }
+        let ms = comeco.elapsed().as_secs_f64() * 1000.0 / 4.0;
+        eprintln!("quadro texturizado 640x480: {ms:.2} ms");
+    }
+
+    /// Textura opaca, o atalho do preenchimento. Mais longe não cobre; mais perto cobre.
+    #[test]
+    fn o_atalho_opaco_respeita_a_profundidade() {
+        let mut state = super::GlState::new(8, 8);
+        state.set_viewport(0, 0, 8, 8);
+        state.set_capability(super::gles::GL_DEPTH_TEST, true);
+        state.set_depth_func(super::gles::GL_LEQUAL);
+        state.clear(super::gles::GL_COLOR_BUFFER_BIT | super::gles::GL_DEPTH_BUFFER_BIT);
+        let pinta = |state: &mut super::GlState, z: f32, cor: [u8; 4]| {
+            state.textures.insert(
+                1,
+                super::Texture {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![cor],
+                    filter: super::gles::GL_NEAREST,
+                    min_filter: super::gles::GL_NEAREST,
+                    ..super::Texture::default()
+                },
+            );
+            let v = |x: f32, y: f32| super::Vertex {
+                position: [x, y, z, 1.0],
+                uv: [0.0, 0.0, 0.0, 1.0],
+                ..Default::default()
+            };
+            state.draw(
+                super::gles::GL_TRIANGLES,
+                &[
+                    v(-1.0, -1.0),
+                    v(1.0, -1.0),
+                    v(1.0, 1.0),
+                    v(-1.0, -1.0),
+                    v(1.0, 1.0),
+                    v(-1.0, 1.0),
+                ],
+            );
+            state.flush();
+        };
+        state.bind_texture(1);
+        state.set_capability(super::gles::GL_TEXTURE_2D, true);
+        pinta(&mut state, 0.0, [255, 0, 0, 255]);
+        assert_eq!(state.color[8 * 4 + 4], [255, 0, 0, 255]);
+        pinta(&mut state, 0.5, [0, 255, 0, 255]);
+        assert_eq!(state.color[8 * 4 + 4], [255, 0, 0, 255]);
+        pinta(&mut state, -0.5, [0, 0, 255, 255]);
+        assert_eq!(state.color[8 * 4 + 4], [0, 0, 255, 255]);
+    }
+
+    /// O filtro inteiro não pode se afastar do que o `pack` do caminho antigo gravaria.
+    #[test]
+    fn a_amostra_inteira_nao_passa_de_dois_niveis() {
+        let mut pixels = vec![[0u8; 4]; 8 * 8];
+        for (i, pixel) in pixels.iter_mut().enumerate() {
+            *pixel = [
+                (i * 17) as u8,
+                (i * 29) as u8,
+                (i * 3) as u8,
+                (i * 13) as u8,
+            ];
+        }
+        let textura = super::Texture {
+            width: 8,
+            height: 8,
+            pixels,
+            filter: super::gles::GL_LINEAR,
+            min_filter: super::gles::GL_LINEAR,
+            ..super::Texture::default()
+        };
+        let texel = super::Texel::novo(&textura).expect("textura");
+        let mut pior = 0i32;
+        let mut u = -0.25f32;
+        while u < 1.25 {
+            let mut v = -0.25f32;
+            while v < 1.25 {
+                for suave in [false, true] {
+                    let inteiro = if suave {
+                        texel.pega::<true>(u, v)
+                    } else {
+                        texel.pega::<false>(u, v)
+                    };
+                    let fino = super::pack(textura.sample_nivel(u, v, 0, suave));
+                    for canal in 0..4 {
+                        pior = pior.max((i32::from(inteiro[canal]) - i32::from(fino[canal])).abs());
+                    }
+                }
+                v += 0.03;
+            }
+            u += 0.03;
+        }
+        assert!(pior <= 2, "a amostra inteira se afastou {pior} níveis");
+    }
+
+    /// Sprite afim: o alfa zero não pinta, o de trás não cobre, o da frente cobre.
+    #[test]
+    fn o_sprite_afim_descarta_o_alfa_e_respeita_a_profundidade() {
+        super::CAMINHO_AFIM.with(|c| c.set(0));
+        let mut state = super::GlState::new(8, 8);
+        state.set_viewport(0, 0, 8, 8);
+        state.set_capability(super::gles::GL_DEPTH_TEST, true);
+        state.set_depth_func(super::gles::GL_LEQUAL);
+        state.set_capability(super::gles::GL_ALPHA_TEST, true);
+        state.set_alpha_func(super::gles::GL_GREATER, 0.5);
+        state.clear(super::gles::GL_COLOR_BUFFER_BIT | super::gles::GL_DEPTH_BUFFER_BIT);
+        let pinta = |state: &mut super::GlState, z: f32, cor: [u8; 4]| {
+            state.textures.insert(
+                1,
+                super::Texture {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![cor],
+                    filter: super::gles::GL_NEAREST,
+                    min_filter: super::gles::GL_NEAREST,
+                    ..super::Texture::default()
+                },
+            );
+            let v = |x: f32, y: f32| super::Vertex {
+                position: [x, y, z, 1.0],
+                uv: [0.0, 0.0, 0.0, 1.0],
+                ..Default::default()
+            };
+            state.draw(
+                super::gles::GL_TRIANGLES,
+                &[
+                    v(-1.0, -1.0),
+                    v(1.0, -1.0),
+                    v(1.0, 1.0),
+                    v(-1.0, -1.0),
+                    v(1.0, 1.0),
+                    v(-1.0, 1.0),
+                ],
+            );
+            state.flush();
+        };
+        state.bind_texture(1);
+        state.set_capability(super::gles::GL_TEXTURE_2D, true);
+        pinta(&mut state, 0.0, [0, 255, 0, 0]);
+        assert_eq!(state.color[8 * 4 + 4], [0, 0, 0, 255]);
+        pinta(&mut state, 0.0, [255, 0, 0, 255]);
+        assert_eq!(state.color[8 * 4 + 4], [255, 0, 0, 255]);
+        pinta(&mut state, 0.5, [0, 255, 0, 255]);
+        assert_eq!(state.color[8 * 4 + 4], [255, 0, 0, 255]);
+        pinta(&mut state, -0.5, [0, 0, 255, 255]);
+        assert_eq!(state.color[8 * 4 + 4], [0, 0, 255, 255]);
+        let caminhos = super::CAMINHO_AFIM.with(|c| c.get());
+        assert!(
+            caminhos >= 4,
+            "o sprite não foi pelo caminho afim ({caminhos})"
+        );
+    }
+
     /// **Uma linha horizontal pinta uma fileira, e só uma.** É o que o degradê do menu do Peggle
     /// pede: uma linha por pixel, lado a lado. Com duas fileiras por linha, a de cima cobriria a
     /// de baixo; com nenhuma, o fundo ficava preto — que era o caso antes das linhas existirem.
@@ -3709,15 +4364,24 @@ mod tests {
             ..Default::default()
         };
         // O centro da fileira 1 de 4 em NDC: (1,5 / 4) * 2 - 1.
-        state.draw(super::gles::GL_LINES, &[vermelho(-1.0, -0.25), vermelho(1.0, -0.25)]);
+        state.draw(
+            super::gles::GL_LINES,
+            &[vermelho(-1.0, -0.25), vermelho(1.0, -0.25)],
+        );
         let quadro = state.present(8, 4);
         let pintados: Vec<usize> = (0..4)
-            .filter(|&linha| quadro[linha * 8..linha * 8 + 8].iter().any(|&p| p == 0xf800))
+            .filter(|&linha| {
+                quadro[linha * 8..linha * 8 + 8]
+                    .iter()
+                    .any(|&p| p == 0xf800)
+            })
             .collect();
         assert_eq!(pintados.len(), 1, "fileiras pintadas: {pintados:?}");
         let linha = pintados[0];
         assert!(
-            quadro[linha * 8..linha * 8 + 8].iter().all(|&p| p == 0xf800),
+            quadro[linha * 8..linha * 8 + 8]
+                .iter()
+                .all(|&p| p == 0xf800),
             "a fileira tem de sair inteira"
         );
     }
@@ -4329,8 +4993,22 @@ mod tests {
         let verde = [-0.8127374, -0.7875298, 0.8354998, 0.9214745];
         let azul = [-0.4027808, -0.3878969, 0.5765068, 0.6939483];
         faixa(&mut state, -1.0, -1.0, 1.0, 1.0, [1.0, 0.0, 0.0, 1.0]);
-        faixa(&mut state, verde[0], verde[1], verde[2], verde[3], [0.0, 1.0, 0.0, 1.0]);
-        faixa(&mut state, azul[0], azul[1], azul[2], azul[3], [0.0, 0.0, 1.0, 1.0]);
+        faixa(
+            &mut state,
+            verde[0],
+            verde[1],
+            verde[2],
+            verde[3],
+            [0.0, 1.0, 0.0, 1.0],
+        );
+        faixa(
+            &mut state,
+            azul[0],
+            azul[1],
+            azul[2],
+            azul[3],
+            [0.0, 0.0, 1.0, 1.0],
+        );
         // Quantos centros de pixel caem dentro de cada retângulo: é o que cada camada tem de
         // cobrir, e nenhum dos cantos cai exatamente num centro.
         let dentro = |r: [f32; 4]| {
@@ -4341,8 +5019,16 @@ mod tests {
         let quadro = pixels(&mut state);
         let verdes = quadro.iter().filter(|p| **p == [0, 255, 0, 255]).count();
         let azuis = quadro.iter().filter(|p| **p == [0, 0, 255, 255]).count();
-        assert_eq!(azuis, dentro(azul), "o azul perdeu pixels para quem estava embaixo");
-        assert_eq!(verdes, dentro(verde) - dentro(azul), "o verde perdeu pixels para o vermelho");
+        assert_eq!(
+            azuis,
+            dentro(azul),
+            "o azul perdeu pixels para quem estava embaixo"
+        );
+        assert_eq!(
+            verdes,
+            dentro(verde) - dentro(azul),
+            "o verde perdeu pixels para o vermelho"
+        );
     }
 
     /// O `y` do `glViewport` conta de baixo para cima, e o quadro é guardado de cima para baixo.
@@ -4358,7 +5044,11 @@ mod tests {
         state.set_viewport(0, 0, 8, 4);
         quad(&mut state, 0.0, [1.0, 0.0, 0.0, 1.0]);
         let quadro = pixels(&mut state);
-        assert_eq!(quadro[6 * 8 + 4], [255, 0, 0, 255], "metade de baixo pintada");
+        assert_eq!(
+            quadro[6 * 8 + 4],
+            [255, 0, 0, 255],
+            "metade de baixo pintada"
+        );
         assert_eq!(quadro[8 + 4], [0, 0, 0, 255], "metade de cima intacta");
     }
 
@@ -4684,9 +5374,8 @@ mod tests {
 /// estado salvo no meio de um `glBegin` prometeria um desenho que nunca existiu.
 impl crate::save_state::Guardavel for GlState {
     fn grava(&self, destino: &mut crate::save_state::Secoes) {
-        let floats = |valores: &[f32]| -> Vec<u32> {
-            valores.iter().map(|v| v.to_bits()).collect()
-        };
+        let floats =
+            |valores: &[f32]| -> Vec<u32> { valores.iter().map(|v| v.to_bits()).collect() };
 
         // As pilhas de matriz, cada uma com a contagem na frente. A de textura da unidade 1 vem
         // por último, e é opcional na leitura: os saves de antes dela têm só as três primeiras.
@@ -4829,7 +5518,10 @@ impl crate::save_state::Guardavel for GlState {
         grava_texturas(&self.textures, destino);
     }
 
-    fn restaura(&mut self, origem: &crate::save_state::Leitor<'_>) -> Result<(), crate::save_state::Erro> {
+    fn restaura(
+        &mut self,
+        origem: &crate::save_state::Leitor<'_>,
+    ) -> Result<(), crate::save_state::Erro> {
         use crate::save_state::Erro;
         let faltando = |nome: &str| Erro::Secao {
             nome: nome.to_string(),
@@ -5051,7 +5743,10 @@ impl crate::save_state::Guardavel for GlState {
         // **Um teto no tamanho declarado.** Um arquivo corrompido — ou escrito por uma versão com
         // outra resolução — não pode fazer o carregamento pedir memória absurda. Acima do tamanho
         // da superfície é recusa, e não alocação.
-        let conferir_tamanho = |nome: &str, declarado: usize, por_pixel: usize| -> Result<usize, Erro> {
+        let conferir_tamanho = |nome: &str,
+                                declarado: usize,
+                                por_pixel: usize|
+         -> Result<usize, Erro> {
             if declarado > teto {
                 return Err(Erro::Secao {
                     nome: nome.to_string(),
@@ -5087,7 +5782,10 @@ impl crate::save_state::Guardavel for GlState {
                 motivo: format!("esperava {quantos} bytes e veio {}", stencil.len()),
             });
         }
-        let cor: Vec<[u8; 4]> = cor.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]]).collect();
+        let cor: Vec<[u8; 4]> = cor
+            .chunks_exact(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
         let profundidade: Vec<f32> = profundidade
             .chunks_exact(4)
             .map(|p| f32::from_bits(u32::from_le_bytes([p[0], p[1], p[2], p[3]])))
@@ -5137,7 +5835,10 @@ fn grava_texturas(
                 textura.mipmaps.len() as u32,
             ],
         );
-        destino.poe(&format!("tex.{id}.pixels"), bytes_dos_pixels(&textura.pixels));
+        destino.poe(
+            &format!("tex.{id}.pixels"),
+            bytes_dos_pixels(&textura.pixels),
+        );
         // As dimensões de cada nível, e depois todos os pixels deles em seguida.
         let mut medidas = Vec::with_capacity(textura.mipmaps.len() * 2);
         let mut pixels = Vec::new();
@@ -5205,7 +5906,10 @@ fn le_texturas(
         if medidas.len() != quantos * 2 {
             return Err(Erro::Secao {
                 nome: format!("tex.{id}.mips"),
-                motivo: format!("diz ter {quantos} nível(is) e veio {} número(s)", medidas.len()),
+                motivo: format!(
+                    "diz ter {quantos} nível(is) e veio {} número(s)",
+                    medidas.len()
+                ),
             });
         }
         let cru = secao_do_estado(origem, &format!("tex.{id}.mip_pixels"))?;
@@ -5343,9 +6047,9 @@ mod testes_do_estado_de_gl {
         let mut secoes = Secoes::nova();
         antes.grava(&mut secoes);
         let tres_pilhas: Vec<u32> = std::iter::once(gles::GL_MODELVIEW)
-            .chain((0..3).flat_map(|_| {
-                std::iter::once(1).chain(IDENTITY.iter().map(|v| v.to_bits()))
-            }))
+            .chain(
+                (0..3).flat_map(|_| std::iter::once(1).chain(IDENTITY.iter().map(|v| v.to_bits()))),
+            )
             .collect();
         secoes.poe_u32s("gl.matrizes", tres_pilhas);
         let arquivo = secoes.fecha();
@@ -5459,7 +6163,11 @@ mod testes_do_estado_de_gl {
         assert_eq!(depois.surface, Some((320, 240)));
         assert!(depois.esticada);
         assert!(depois.sujo);
-        assert_eq!(depois.clear_color, [0.25, 0.5, 0.75, 1.0], "as cores são f32");
+        assert_eq!(
+            depois.clear_color,
+            [0.25, 0.5, 0.75, 1.0],
+            "as cores são f32"
+        );
         assert_eq!(depois.clear_depth, 0.5);
         assert_eq!(depois.current_color, [1.0, 0.0, 0.5, 0.25]);
         assert_eq!(depois.clear_stencil, 7);
@@ -5566,7 +6274,10 @@ mod testes_do_estado_de_gl {
         assert_eq!((textura.filter, textura.min_filter), (0x2601, 0x2703));
         assert_eq!(textura.crop, [1, -2, 3, -4], "o recorte é assinado");
         assert_eq!(textura.mipmaps.len(), 1, "a cadeia de mipmaps não voltou");
-        assert_eq!((textura.mipmaps[0].width, textura.mipmaps[0].height), (2, 2));
+        assert_eq!(
+            (textura.mipmaps[0].width, textura.mipmaps[0].height),
+            (2, 2)
+        );
         assert_eq!(
             textura.mipmaps[0].pixels, nivel_um,
             "os pixels do nível um não voltaram"
@@ -5617,7 +6328,11 @@ mod testes_do_estado_de_gl {
     #[test]
     fn os_buffers_de_cor_profundidade_e_stencil_vem_de_volta() {
         let mut antes = GlState::new(4, 2);
-        assert_eq!(antes.color.len(), 8, "o estado novo já tem os buffers da superfície");
+        assert_eq!(
+            antes.color.len(),
+            8,
+            "o estado novo já tem os buffers da superfície"
+        );
         antes.color[0] = [1, 2, 3, 4];
         antes.color[7] = [5, 6, 7, 8];
         antes.depth[3] = 0.25;

@@ -30,8 +30,8 @@ type ContextoProprio = Contexto;
 type ContextoProprio = ();
 use super::gles;
 use super::rasterizer::{
-    GlState, Matrix, linhas_em_triangulos, QuadroNaPlaca, Rasterizador, TexEnv, Texture as TexturaSalva,
-    UnidadeDeTextura, UV_PADRAO, Vertex,
+    GlState, Matrix, QuadroNaPlaca, Rasterizador, TexEnv, Texture as TexturaSalva, UV_PADRAO,
+    UnidadeDeTextura, Vertex, linhas_em_triangulos,
 };
 use glow::{self, HasContext};
 use std::collections::HashMap;
@@ -159,6 +159,17 @@ impl Default for Estado {
 /// antes da leitura —, e um blit que mente **não dá erro**: dá imagem errada em silêncio, que é
 /// exatamente o tipo de defeito que só aparece no aparelho de quem está jogando.
 ///
+/// O formato interno da cor. No OpenGL ES 2 o interno tem de ser o mesmo do `format`: `RGBA8`
+/// é do ES 3, e o vitaGL recusa o sized format mesmo tendo o token.
+fn formato_de_cor(gl: &glow::Context) -> u32 {
+    let versao = gl.version();
+    if versao.is_embedded && versao.major < 3 {
+        glow::RGBA
+    } else {
+        glow::RGBA8
+    }
+}
+
 /// A prova é mínima de propósito: 2×2, uma cor chapada, ida e volta pela CPU. Custa duas texturas
 /// e dois framebuffers, uma vez por contexto.
 #[cfg(not(target_arch = "wasm32"))]
@@ -176,7 +187,7 @@ fn blit_serve(gl: &glow::Context) -> bool {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    glow::RGBA8 as i32,
+                    formato_de_cor(&gl) as i32,
                     largura as i32,
                     largura as i32,
                     0,
@@ -626,8 +637,9 @@ impl GpuState {
             #[cfg(not(feature = "gpu"))]
             None => {
                 return Err(
-                    "sem contexto emprestado: esta construção não abre contexto de placa".to_string(),
-                )
+                    "sem contexto emprestado: esta construção não abre contexto de placa"
+                        .to_string(),
+                );
             }
         };
         let (programa, vao, vbo, ponte) = unsafe {
@@ -770,7 +782,7 @@ impl GpuState {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::RGBA8 as i32,
+                formato_de_cor(&gl) as i32,
                 largura,
                 altura,
                 0,
@@ -832,7 +844,7 @@ impl GpuState {
                     gl.renderbuffer_storage_multisample(
                         glow::RENDERBUFFER,
                         amostras as i32,
-                        glow::RGBA8,
+                        formato_de_cor(&gl),
                         largura,
                         altura,
                     );
@@ -890,6 +902,43 @@ impl GpuState {
             // curto, e é por isso que ela vive em `alvo_do_desenho`.
             let alvo = self.alvo_do_desenho();
             gl.bind_framebuffer(glow::FRAMEBUFFER, alvo);
+            let mut estado = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            // O ES 2 não garante profundidade e stencil no mesmo anexo. O vitaGL tem o token
+            // `DEPTH24_STENCIL8`, mas se o framebuffer não fecha, a profundidade de 16 bits —
+            // que o ES 2 exige — ainda deixa o teste de Z funcionar.
+            if estado != glow::FRAMEBUFFER_COMPLETE && amostras <= 1 {
+                gl.framebuffer_renderbuffer(
+                    glow::FRAMEBUFFER,
+                    glow::DEPTH_STENCIL_ATTACHMENT,
+                    glow::RENDERBUFFER,
+                    None,
+                );
+                gl.bind_renderbuffer(glow::RENDERBUFFER, Some(profundidade));
+                gl.renderbuffer_storage(
+                    glow::RENDERBUFFER,
+                    glow::DEPTH_COMPONENT16,
+                    largura,
+                    altura,
+                );
+                gl.framebuffer_renderbuffer(
+                    glow::FRAMEBUFFER,
+                    glow::DEPTH_ATTACHMENT,
+                    glow::RENDERBUFFER,
+                    Some(profundidade),
+                );
+                estado = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            }
+            if estado != glow::FRAMEBUFFER_COMPLETE {
+                static JA: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !JA.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::registro!(
+                        crate::registro::Nivel::Aviso,
+                        "gl",
+                        "framebuffer da placa incompleto ({estado:#x})"
+                    );
+                }
+            }
         }
     }
 
@@ -929,7 +978,7 @@ impl GpuState {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    glow::RGBA8 as i32,
+                    formato_de_cor(&gl) as i32,
                     w,
                     h,
                     0,
@@ -938,8 +987,16 @@ impl GpuState {
                     glow::PixelUnpackData::Slice(None),
                 );
                 // Os mesmos filtros da `cor`: quem apresenta amostra uma ou a outra.
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
-                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::NEAREST as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::NEAREST as i32,
+                );
                 let fbo = gl.create_framebuffer().expect("framebuffer da frente");
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
                 gl.framebuffer_texture_2d(
@@ -957,7 +1014,18 @@ impl GpuState {
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, frente);
             gl.disable(glow::SCISSOR_TEST);
             self.esquece_a_tesoura();
-            gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+            gl.blit_framebuffer(
+                0,
+                0,
+                w,
+                h,
+                0,
+                0,
+                w,
+                h,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
             gl.bind_framebuffer(glow::FRAMEBUFFER, self.alvo_do_desenho());
         }
         self.frente_valida = true;
@@ -993,7 +1061,18 @@ impl GpuState {
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(destino.fbo));
             gl.disable(glow::SCISSOR_TEST);
             self.esquece_a_tesoura();
-            gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+            gl.blit_framebuffer(
+                0,
+                0,
+                w,
+                h,
+                0,
+                0,
+                w,
+                h,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            );
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(destino.fbo));
         }
     }
@@ -1088,7 +1167,7 @@ impl GpuState {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    glow::RGBA8 as i32,
+                    formato_de_cor(&gl) as i32,
                     salva.width as i32,
                     salva.height as i32,
                     0,
@@ -1111,7 +1190,7 @@ impl GpuState {
                     gl.tex_image_2d(
                         glow::TEXTURE_2D,
                         nivel_gl as i32,
-                        glow::RGBA8 as i32,
+                        formato_de_cor(&gl) as i32,
                         nivel.width as i32,
                         nivel.height as i32,
                         0,
@@ -1283,10 +1362,7 @@ impl GpuState {
 
     /// Quantas chamadas de estado o espelho enviou e quantas poupou.
     pub fn estado_enviado_e_poupado(&self) -> (u64, u64) {
-        (
-            self.envios_de_estado.get(),
-            self.poupancas_de_estado.get(),
-        )
+        (self.envios_de_estado.get(), self.poupancas_de_estado.get())
     }
 
     fn aplica(&mut self) {
@@ -1329,8 +1405,7 @@ impl GpuState {
             // lote custa validação no driver Mali e deixa `GL_INVALID_ENUM` pendente — e é por
             // isso que ele tem um valor próprio aqui, em vez de ir direto para a chamada.
             let embutido = gl.version().is_embedded;
-            if !embutido
-                && Espelho::mudou(&mut m.abraco_de_profundidade, true, &mut e_n, &mut p_n)
+            if !embutido && Espelho::mudou(&mut m.abraco_de_profundidade, true, &mut e_n, &mut p_n)
             {
                 gl.enable(glow::DEPTH_CLAMP);
             }
@@ -1431,8 +1506,7 @@ impl GpuState {
             }
         }
         self.espelho.set(m);
-        self.envios_de_estado
-            .set(self.envios_de_estado.get() + e_n);
+        self.envios_de_estado.set(self.envios_de_estado.get() + e_n);
         self.poupancas_de_estado
             .set(self.poupancas_de_estado.get() + p_n);
     }
@@ -1491,7 +1565,10 @@ impl GpuState {
                 .map(|t| t.objeto)
         });
         let textura1 = match (textura_da_ponte, self.fill.unidade1.ligada) {
-            (false, true) => self.texturas.get(&self.fill.unidade1.textura).map(|t| t.objeto),
+            (false, true) => self
+                .texturas
+                .get(&self.fill.unidade1.textura)
+                .map(|t| t.objeto),
             _ => None,
         };
         let gl = &self.gl;
@@ -1505,9 +1582,13 @@ impl GpuState {
             }
             let passo = (FLOATS_POR_VERTICE * 4) as i32;
             if !self.vao_pronto {
-                for (indice, tamanho, deslocamento) in
-                    [(0u32, 4i32, 0i32), (1, 4, 16), (2, 2, 32), (3, 1, 40), (4, 2, 44)]
-                {
+                for (indice, tamanho, deslocamento) in [
+                    (0u32, 4i32, 0i32),
+                    (1, 4, 16),
+                    (2, 2, 32),
+                    (3, 1, 40),
+                    (4, 2, 44),
+                ] {
                     gl.enable_vertex_attrib_array(indice);
                     gl.vertex_attrib_pointer_f32(
                         indice,
@@ -1542,17 +1623,41 @@ impl GpuState {
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, textura);
             uniforme_i32(gl, &self.uniformes, self.programa, "amostra", 0);
-            uniforme_i32(gl, &self.uniformes, self.programa, "texturando", i32::from(textura.is_some()));
-            envia_env(gl, &self.uniformes, self.programa, "", &self.fill.env_textura);
+            uniforme_i32(
+                gl,
+                &self.uniformes,
+                self.programa,
+                "texturando",
+                i32::from(textura.is_some()),
+            );
+            envia_env(
+                gl,
+                &self.uniformes,
+                self.programa,
+                "",
+                &self.fill.env_textura,
+            );
             // A unidade 1 só entra com textura de verdade: ligada sem textura carregada, ela
             // passaria o anterior adiante com um texel preto.
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, textura1);
             gl.active_texture(glow::TEXTURE0);
             uniforme_i32(gl, &self.uniformes, self.programa, "amostra1", 1);
-            uniforme_i32(gl, &self.uniformes, self.programa, "texturando1", i32::from(textura1.is_some()));
+            uniforme_i32(
+                gl,
+                &self.uniformes,
+                self.programa,
+                "texturando1",
+                i32::from(textura1.is_some()),
+            );
             if textura1.is_some() {
-                envia_env(gl, &self.uniformes, self.programa, "1", &self.fill.unidade1.env);
+                envia_env(
+                    gl,
+                    &self.uniformes,
+                    self.programa,
+                    "1",
+                    &self.fill.unidade1.env,
+                );
             }
             uniforme_i32(
                 gl,
@@ -1564,7 +1669,13 @@ impl GpuState {
                     false => 7,
                 },
             );
-            uniforme_f32(gl, &self.uniformes, self.programa, "ref_alfa", self.fill.ref_alfa);
+            uniforme_f32(
+                gl,
+                &self.uniformes,
+                self.programa,
+                "ref_alfa",
+                self.fill.ref_alfa,
+            );
             uniforme_f32(gl, &self.uniformes, self.programa, "virar", virar);
             let neblina = self.fill.neblina;
             uniforme_i32(
@@ -1574,7 +1685,13 @@ impl GpuState {
                 "com_neblina",
                 i32::from(neblina.ligada && neblina.permitida),
             );
-            uniforme_vec3(gl, &self.uniformes, self.programa, "cor_neblina", neblina.cor);
+            uniforme_vec3(
+                gl,
+                &self.uniformes,
+                self.programa,
+                "cor_neblina",
+                neblina.cor,
+            );
             gl.draw_arrays(modo, primeiro as i32, quantos as i32);
             // **Nao desligue aqui.** Desligar no fim de cada desenho era o custo que este cache
             // veio tirar: um programa a menos por lote e uma revalidacao a menos em cada um.
@@ -1634,7 +1751,7 @@ impl GpuState {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    glow::RGBA8 as i32,
+                    formato_de_cor(&gl) as i32,
                     fw,
                     fh,
                     0,
@@ -1820,7 +1937,11 @@ impl GpuState {
             };
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, min as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, t.filtro as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, t.maior_nivel as i32);
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAX_LEVEL,
+                t.maior_nivel as i32,
+            );
             for (eixo, modo) in [
                 (glow::TEXTURE_WRAP_S, t.wrap[0]),
                 (glow::TEXTURE_WRAP_T, t.wrap[1]),
@@ -1929,16 +2050,32 @@ impl Uniformes {
     }
 }
 
-fn uniforme_i32(gl: &glow::Context, u: &Uniformes, programa: glow::Program, nome: &str, valor: i32) {
+fn uniforme_i32(
+    gl: &glow::Context,
+    u: &Uniformes,
+    programa: glow::Program,
+    nome: &str,
+    valor: i32,
+) {
     u.define(gl, programa, nome, [valor as u32, 0, 0, 0], |onde| unsafe {
         gl.uniform_1_i32(Some(onde), valor)
     });
 }
 
-fn uniforme_f32(gl: &glow::Context, u: &Uniformes, programa: glow::Program, nome: &str, valor: f32) {
-    u.define(gl, programa, nome, [valor.to_bits(), 0, 0, 0], |onde| unsafe {
-        gl.uniform_1_f32(Some(onde), valor)
-    });
+fn uniforme_f32(
+    gl: &glow::Context,
+    u: &Uniformes,
+    programa: glow::Program,
+    nome: &str,
+    valor: f32,
+) {
+    u.define(
+        gl,
+        programa,
+        nome,
+        [valor.to_bits(), 0, 0, 0],
+        |onde| unsafe { gl.uniform_1_f32(Some(onde), valor) },
+    );
 }
 
 /// Um uniforme de quatro componentes, para a cor do `GL_TEXTURE_ENV_COLOR`.
@@ -1962,7 +2099,12 @@ fn uniforme_vec3(
     nome: &str,
     valor: [f32; 4],
 ) {
-    let bits = [valor[0].to_bits(), valor[1].to_bits(), valor[2].to_bits(), 0];
+    let bits = [
+        valor[0].to_bits(),
+        valor[1].to_bits(),
+        valor[2].to_bits(),
+        0,
+    ];
     u.define(gl, programa, nome, bits, |onde| unsafe {
         gl.uniform_3_f32(Some(onde), valor[0], valor[1], valor[2])
     });
@@ -2045,11 +2187,35 @@ fn envia_env(
     }
     for lado in 0..2 {
         let nome = ["rgb", "alfa"][lado];
-        uniforme_i32(gl, u, programa, &format!("cmb_{nome}{sufixo}"), codigo_funcao(env.combina[lado]));
-        uniforme_f32(gl, u, programa, &format!("escala_{nome}{sufixo}"), env.escala[lado]);
+        uniforme_i32(
+            gl,
+            u,
+            programa,
+            &format!("cmb_{nome}{sufixo}"),
+            codigo_funcao(env.combina[lado]),
+        );
+        uniforme_f32(
+            gl,
+            u,
+            programa,
+            &format!("escala_{nome}{sufixo}"),
+            env.escala[lado],
+        );
         for i in 0..3 {
-            uniforme_i32(gl, u, programa, &format!("src_{nome}{sufixo}[{i}]"), codigo_fonte(env.fontes[lado][i]));
-            uniforme_i32(gl, u, programa, &format!("op_{nome}{sufixo}[{i}]"), codigo_operando(env.operandos[lado][i]));
+            uniforme_i32(
+                gl,
+                u,
+                programa,
+                &format!("src_{nome}{sufixo}[{i}]"),
+                codigo_fonte(env.fontes[lado][i]),
+            );
+            uniforme_i32(
+                gl,
+                u,
+                programa,
+                &format!("op_{nome}{sufixo}[{i}]"),
+                codigo_operando(env.operandos[lado][i]),
+            );
         }
     }
     uniforme_vec4(gl, u, programa, &format!("cor_env{sufixo}"), env.cor);
@@ -2269,21 +2435,292 @@ void main() {
 }
 "#;
 
-/// Compila o par de shaders, tentando GLSL 3.30 e caindo para ES 3.00.
-unsafe fn compila(gl: &glow::Context) -> Result<glow::Program, String> {
-    ["#version 330 core\n", "#version 300 es\nprecision highp float;\n"]
-        .into_iter()
-        .find_map(|cabecalho| unsafe { liga_programa(gl, cabecalho) }.ok())
-        .ok_or_else(|| "nenhuma versão de GLSL aceita".to_string())
+/// O mesmo vértice, em GLSL ES 1.00. O vitaGL traduz isso, e não `#version 300 es`.
+const VERTICE_ES2: &str = r#"
+attribute vec4 pos;
+attribute vec4 cor;
+attribute vec2 uv;
+attribute float fog;
+attribute vec2 uv1;
+uniform float virar;
+varying vec4 vcor;
+varying vec2 vuv;
+varying float vfog;
+varying vec2 vuv1;
+void main() {
+    vcor = cor;
+    vuv = uv;
+    vfog = fog;
+    vuv1 = uv1;
+    gl_Position = vec4(pos.x, pos.y * virar, pos.z, pos.w);
+}
+"#;
+
+/// O fragmento do ES 3 reescrito para o ES 1.00: sem `in`/`out`, sem `texture()`, sem vetor
+/// como argumento de função. Os índices de uniforme são constantes — o tradutor do vitaGL não
+/// aceita indexar um vetor com a variável do laço.
+const FRAGMENTO_ES2: &str = r#"
+precision mediump float;
+precision mediump int;
+varying vec4 vcor;
+varying vec2 vuv;
+varying float vfog;
+varying vec2 vuv1;
+uniform sampler2D amostra;
+uniform sampler2D amostra1;
+uniform int com_neblina;
+uniform vec3 cor_neblina;
+uniform int texturando;
+uniform int texturando1;
+uniform int env;
+uniform int cmb_rgb;
+uniform int cmb_alfa;
+uniform int src_rgb[3];
+uniform int op_rgb[3];
+uniform int src_alfa[3];
+uniform int op_alfa[3];
+uniform float escala_rgb;
+uniform float escala_alfa;
+uniform vec4 cor_env;
+uniform int env1;
+uniform int cmb_rgb1;
+uniform int cmb_alfa1;
+uniform int src_rgb1[3];
+uniform int op_rgb1[3];
+uniform int src_alfa1[3];
+uniform int op_alfa1[3];
+uniform float escala_rgb1;
+uniform float escala_alfa1;
+uniform vec4 cor_env1;
+uniform int func_alfa;
+uniform float ref_alfa;
+
+vec4 fonte_de(int qual, vec4 anterior, vec4 primaria, vec4 texel, vec4 constante, vec4 texel0,
+              vec4 texel1) {
+    if (qual == 0) { return texel; }
+    if (qual == 1) { return constante; }
+    if (qual == 2) { return primaria; }
+    if (qual == 4) { return texel0; }
+    if (qual == 5) { return texel1; }
+    return anterior;
 }
 
-unsafe fn liga_programa(gl: &glow::Context, cabecalho: &str) -> Result<glow::Program, String> {
+vec3 operando_rgb(int op, vec4 v) {
+    if (op == 0) { return v.rgb; }
+    if (op == 1) { return vec3(1.0) - v.rgb; }
+    if (op == 2) { return vec3(v.a); }
+    return vec3(1.0 - v.a);
+}
+
+float operando_alfa(int op, vec4 v) {
+    if (op == 1 || op == 3) { return 1.0 - v.a; }
+    return v.a;
+}
+
+vec3 funcao_rgb(int f, vec3 a0, vec3 a1, vec3 a2) {
+    if (f == 0) { return a0; }
+    if (f == 2) { return a0 + a1; }
+    if (f == 3) { return a0 + a1 - 0.5; }
+    if (f == 4) { return a0 * a2 + a1 * (1.0 - a2); }
+    if (f == 5) { return a0 - a1; }
+    if (f == 6 || f == 7) { return vec3(4.0 * dot(a0 - 0.5, a1 - 0.5)); }
+    return a0 * a1;
+}
+
+float funcao_alfa(int f, float a0, float a1, float a2) {
+    if (f == 0) { return a0; }
+    if (f == 2) { return a0 + a1; }
+    if (f == 3) { return a0 + a1 - 0.5; }
+    if (f == 4) { return a0 * a2 + a1 * (1.0 - a2); }
+    if (f == 5) { return a0 - a1; }
+    return a0 * a1;
+}
+
+bool falta(int s0, int s1, int s2, int a0, int a1, int a2) {
+    if ((s0 == 4 || s1 == 4 || s2 == 4 || a0 == 4 || a1 == 4 || a2 == 4) && texturando != 1) {
+        return true;
+    }
+    if ((s0 == 5 || s1 == 5 || s2 == 5 || a0 == 5 || a1 == 5 || a2 == 5) && texturando1 != 1) {
+        return true;
+    }
+    return false;
+}
+
+vec4 unidade(int modo, int crgb, int calfa, int srgb0, int srgb1, int srgb2, int orgb0, int orgb1,
+             int orgb2, int salfa0, int salfa1, int salfa2, int oalfa0, int oalfa1, int oalfa2,
+             float ergb, float ealfa, vec4 constante, vec4 anterior, vec4 primaria, vec4 texel,
+             vec4 texel0, vec4 texel1) {
+    if (modo == 4) {
+        if (falta(srgb0, srgb1, srgb2, salfa0, salfa1, salfa2)) { return anterior; }
+        vec4 f0 = fonte_de(srgb0, anterior, primaria, texel, constante, texel0, texel1);
+        vec4 f1 = fonte_de(srgb1, anterior, primaria, texel, constante, texel0, texel1);
+        vec4 f2 = fonte_de(srgb2, anterior, primaria, texel, constante, texel0, texel1);
+        vec3 r0 = operando_rgb(orgb0, f0);
+        vec3 r1 = operando_rgb(orgb1, f1);
+        vec3 r2 = operando_rgb(orgb2, f2);
+        vec4 g0 = fonte_de(salfa0, anterior, primaria, texel, constante, texel0, texel1);
+        vec4 g1 = fonte_de(salfa1, anterior, primaria, texel, constante, texel0, texel1);
+        vec4 g2 = fonte_de(salfa2, anterior, primaria, texel, constante, texel0, texel1);
+        float a0 = operando_alfa(oalfa0, g0);
+        float a1 = operando_alfa(oalfa1, g1);
+        float a2 = operando_alfa(oalfa2, g2);
+        vec3 rgb = clamp(funcao_rgb(crgb, r0, r1, r2) * ergb, 0.0, 1.0);
+        float alfa = clamp(funcao_alfa(calfa, a0, a1, a2) * ealfa, 0.0, 1.0);
+        if (crgb == 7) { alfa = rgb.r; }
+        return vec4(rgb, alfa);
+    }
+    if (modo == 0) { return texel; }
+    if (modo == 1) {
+        return vec4(anterior.rgb * (1.0 - texel.a) + texel.rgb * texel.a, anterior.a);
+    }
+    if (modo == 2) {
+        return vec4(min(anterior.rgb + texel.rgb, vec3(1.0)), anterior.a * texel.a);
+    }
+    return anterior * texel;
+}
+
+void main() {
+    vec4 primaria = vcor;
+    vec4 cor = primaria;
+    vec4 texel0 = texturando == 1 ? texture2D(amostra, vuv) : vec4(0.0);
+    vec4 texel1 = texturando1 == 1 ? texture2D(amostra1, vuv1) : vec4(0.0);
+    if (texturando == 1) {
+        cor = unidade(env, cmb_rgb, cmb_alfa, src_rgb[0], src_rgb[1], src_rgb[2], op_rgb[0],
+                      op_rgb[1], op_rgb[2], src_alfa[0], src_alfa[1], src_alfa[2], op_alfa[0],
+                      op_alfa[1], op_alfa[2], escala_rgb, escala_alfa, cor_env, cor, primaria,
+                      texel0, texel0, texel1);
+    }
+    if (texturando1 == 1) {
+        cor = unidade(env1, cmb_rgb1, cmb_alfa1, src_rgb1[0], src_rgb1[1], src_rgb1[2], op_rgb1[0],
+                      op_rgb1[1], op_rgb1[2], src_alfa1[0], src_alfa1[1], src_alfa1[2], op_alfa1[0],
+                      op_alfa1[1], op_alfa1[2], escala_rgb1, escala_alfa1, cor_env1, cor, primaria,
+                      texel1, texel0, texel1);
+    }
+    if (com_neblina == 1) {
+        cor = vec4(mix(cor_neblina, cor.rgb, clamp(vfog, 0.0, 1.0)), cor.a);
+    }
+    bool passa;
+    if      (func_alfa == 0) { passa = false; }
+    else if (func_alfa == 1) { passa = cor.a <  ref_alfa; }
+    else if (func_alfa == 2) { passa = cor.a == ref_alfa; }
+    else if (func_alfa == 3) { passa = cor.a <= ref_alfa; }
+    else if (func_alfa == 4) { passa = cor.a >  ref_alfa; }
+    else if (func_alfa == 5) { passa = cor.a != ref_alfa; }
+    else if (func_alfa == 6) { passa = cor.a >= ref_alfa; }
+    else                     { passa = true; }
+    if (!passa) { discard; }
+    gl_FragColor = cor;
+}
+"#;
+
+/// Sem o `GL_COMBINE`. O ES 2 garante 16 vetores de uniforme no fragmento, e a cadeia do
+/// combine passa disso em placa que não empacota `int`. O modo 4 cai no modulate.
+const FRAGMENTO_ES2_CURTO: &str = r#"
+precision mediump float;
+varying vec4 vcor;
+varying vec2 vuv;
+varying float vfog;
+varying vec2 vuv1;
+uniform sampler2D amostra;
+uniform sampler2D amostra1;
+uniform int com_neblina;
+uniform vec3 cor_neblina;
+uniform int texturando;
+uniform int texturando1;
+uniform int env;
+uniform int env1;
+uniform int func_alfa;
+uniform float ref_alfa;
+
+vec4 aplica(int modo, vec4 anterior, vec4 texel) {
+    if (modo == 0) { return texel; }
+    if (modo == 1) {
+        return vec4(anterior.rgb * (1.0 - texel.a) + texel.rgb * texel.a, anterior.a);
+    }
+    if (modo == 2) {
+        return vec4(min(anterior.rgb + texel.rgb, vec3(1.0)), anterior.a * texel.a);
+    }
+    return anterior * texel;
+}
+
+void main() {
+    vec4 cor = vcor;
+    if (texturando == 1) { cor = aplica(env, cor, texture2D(amostra, vuv)); }
+    if (texturando1 == 1) { cor = aplica(env1, cor, texture2D(amostra1, vuv1)); }
+    if (com_neblina == 1) {
+        cor = vec4(mix(cor_neblina, cor.rgb, clamp(vfog, 0.0, 1.0)), cor.a);
+    }
+    bool passa;
+    if      (func_alfa == 0) { passa = false; }
+    else if (func_alfa == 1) { passa = cor.a <  ref_alfa; }
+    else if (func_alfa == 2) { passa = cor.a == ref_alfa; }
+    else if (func_alfa == 3) { passa = cor.a <= ref_alfa; }
+    else if (func_alfa == 4) { passa = cor.a >  ref_alfa; }
+    else if (func_alfa == 5) { passa = cor.a != ref_alfa; }
+    else if (func_alfa == 6) { passa = cor.a >= ref_alfa; }
+    else                     { passa = true; }
+    if (!passa) { discard; }
+    gl_FragColor = cor;
+}
+"#;
+
+/// Compila o par de shaders. Desktop e GLES 3 usam o texto novo; o vitaGL só traduz o ES 1.00.
+unsafe fn compila(gl: &glow::Context) -> Result<glow::Program, String> {
+    let versao = gl.version();
+    // No ES 2 o texto completo do combine chega a compilar no SceShaccCg e morre
+    // dentro do `glLinkProgram`: o vitaGL chama `sceGxmProgramGetParameterCount`
+    // num programa GXM inválido, e o processo acaba sem um erro de link que
+    // deixasse cair no texto curto. O coredump ao abrir o jogo estava nesse
+    // `blx`, com o fonte do combine (`src_rgb1`) ainda no heap. O curto cabe
+    // nos 16 vetores de uniforme do fragmento; o `GL_COMBINE` vira modulate.
+    let es2 = versao.is_embedded && versao.major < 3;
+    let completo = [
+        ("#version 330 core\n", VERTICE, FRAGMENTO),
+        (
+            "#version 300 es\nprecision highp float;\n",
+            VERTICE,
+            FRAGMENTO,
+        ),
+        ("#version 100\n", VERTICE_ES2, FRAGMENTO_ES2),
+        ("#version 100\n", VERTICE_ES2, FRAGMENTO_ES2_CURTO),
+        ("\n", VERTICE_ES2, FRAGMENTO_ES2_CURTO),
+    ];
+    let curto = [
+        ("#version 100\n", VERTICE_ES2, FRAGMENTO_ES2_CURTO),
+        ("\n", VERTICE_ES2, FRAGMENTO_ES2_CURTO),
+    ];
+    let tentativas: &[(&str, &str, &str)] = if es2 { &curto } else { &completo };
+    let mut ultimo = String::from("nenhuma versão de GLSL aceita");
+    for &(cabecalho, vertice, fragmento) in tentativas {
+        match unsafe { liga_programa(gl, cabecalho, vertice, fragmento) } {
+            Ok(programa) => return Ok(programa),
+            Err(erro) => {
+                // A primeira versão que o driver recusa explica, no aparelho, qual texto
+                // chegou a ligar. No desktop a 3.30 passa e esta linha não roda.
+                crate::registro!(
+                    crate::registro::Nivel::Aviso,
+                    "gl",
+                    "shader recusado: {erro}"
+                );
+                ultimo = erro;
+            }
+        }
+    }
+    Err(ultimo)
+}
+
+unsafe fn liga_programa(
+    gl: &glow::Context,
+    cabecalho: &str,
+    vertice: &str,
+    fragmento: &str,
+) -> Result<glow::Program, String> {
     unsafe {
         let programa = gl.create_program()?;
         let mut shaders = Vec::new();
         for (tipo, fonte) in [
-            (glow::VERTEX_SHADER, VERTICE),
-            (glow::FRAGMENT_SHADER, FRAGMENTO),
+            (glow::VERTEX_SHADER, vertice),
+            (glow::FRAGMENT_SHADER, fragmento),
         ] {
             let shader = gl.create_shader(tipo)?;
             gl.shader_source(shader, &format!("{cabecalho}{fonte}"));
@@ -2300,9 +2737,14 @@ unsafe fn liga_programa(gl: &glow::Context, cabecalho: &str) -> Result<glow::Pro
             gl.attach_shader(programa, shader);
             shaders.push(shader);
         }
+        // O ES 1.00 não tem `layout(location)`. Os índices são os do `vertex_attrib_pointer`.
+        for (indice, nome) in [(0, "pos"), (1, "cor"), (2, "uv"), (3, "fog"), (4, "uv1")] {
+            gl.bind_attrib_location(programa, indice, nome);
+        }
         gl.link_program(programa);
+        // Sem `glDetachShader`: o vitaGL não exporta essa entrada, e o glow aborta
+        // se o ponteiro é nulo. O shader marcado para apagar sai junto com o programa.
         for shader in shaders {
-            gl.detach_shader(programa, shader);
             gl.delete_shader(shader);
         }
         if !gl.get_program_link_status(programa) {
@@ -2320,7 +2762,11 @@ fn expande565(bytes: &[u8], offset: usize) -> [u8; 3] {
     let r = ((pixel >> 11) & 31) as u8;
     let g = ((pixel >> 5) & 63) as u8;
     let b = (pixel & 31) as u8;
-    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
+    [
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+    ]
 }
 
 impl Rasterizador for GpuState {
@@ -2362,6 +2808,13 @@ impl Rasterizador for GpuState {
     /// qualquer desenho, e é a hora certa de não confiar no que ficou de antes. Custa três chamadas
     /// de driver por quadro, e não por lote, mais o estado de desenho reenviado uma vez no primeiro
     /// lote — o espelho também esquece, pelo mesmo motivo.
+    fn textura_do_quadro(&self) -> Option<u32> {
+        // Na troca o destino ainda é o quadro apresentado. A frente só recebe a cópia quando o
+        // quadro seguinte começa a escrever por cima, e isso ainda não aconteceu.
+        let cor = self.quadro.as_ref().map(|destino| destino.cor)?;
+        Some(cor.0.get())
+    }
+
     fn desenha_no_fbo(&mut self, fbo: Option<u32>) {
         if fbo.is_some() {
             self.esquece_o_espelho();
@@ -2709,7 +3162,12 @@ impl Rasterizador for GpuState {
                 // de estado faz em `recria_texturas_restauradas`.
                 let (filtro, filtro_min, wrap, crop) = match self.estado.textures.get(&name) {
                     Some(t) => (t.filter, t.min_filter, t.wrap, t.crop),
-                    None => (gles::GL_LINEAR, gles::GL_LINEAR, [gles::GL_REPEAT; 2], [0; 4]),
+                    None => (
+                        gles::GL_LINEAR,
+                        gles::GL_LINEAR,
+                        [gles::GL_REPEAT; 2],
+                        [0; 4],
+                    ),
                 };
                 self.texturas.insert(
                     name,
@@ -2733,7 +3191,7 @@ impl Rasterizador for GpuState {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 level as i32,
-                glow::RGBA8 as i32,
+                formato_de_cor(&gl) as i32,
                 width as i32,
                 height as i32,
                 0,
@@ -3095,10 +3553,7 @@ impl Rasterizador for GpuState {
         if self.descarta_tiles && self.fbo_externo.is_none() {
             let gl = &self.gl;
             unsafe {
-                gl.invalidate_framebuffer(
-                    glow::FRAMEBUFFER,
-                    &[glow::DEPTH, glow::STENCIL],
-                );
+                gl.invalidate_framebuffer(glow::FRAMEBUFFER, &[glow::DEPTH, glow::STENCIL]);
             }
         }
     }
@@ -3159,7 +3614,7 @@ impl Rasterizador for GpuState {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::RGBA8 as i32,
+                formato_de_cor(&gl) as i32,
                 colunas as i32,
                 linhas as i32,
                 0,
@@ -3247,7 +3702,10 @@ impl Rasterizador for GpuState {
         self.destino();
         // O que a tela mostra: a frente, quando o jogo já escreveu no destino depois da troca.
         match self.frente_valida && self.fbo_externo.is_none() {
-            true => unsafe { self.gl.bind_framebuffer(glow::FRAMEBUFFER, self.frente.map(|f| f.0)) },
+            true => unsafe {
+                self.gl
+                    .bind_framebuffer(glow::FRAMEBUFFER, self.frente.map(|f| f.0))
+            },
             false => self.resolve(),
         }
         let (sw, sh) = self.estado.surface();
@@ -3271,7 +3729,9 @@ impl Rasterizador for GpuState {
     fn define_proporcao(&mut self, aspecto: Option<f32>) {
         self.descarrega();
         // Mais estreito que o nativo não abre nada; o teto evita um anexo absurdo.
-        let aspecto = aspecto.filter(|a| a.is_finite()).map(|a| a.clamp(4.0 / 3.0, 3.6));
+        let aspecto = aspecto
+            .filter(|a| a.is_finite())
+            .map(|a| a.clamp(4.0 / 3.0, 3.6));
         if aspecto != self.proporcao {
             self.proporcao = aspecto;
             self.sujo = true;
@@ -3438,10 +3898,22 @@ mod tests {
         gpu.delete_texture(20);
         gpu.restaura_estado(&leitor).unwrap();
 
-        assert!(gpu.texturas.contains_key(&10), "a textura base nao voltou para a placa");
-        assert!(gpu.texturas.contains_key(&20), "a textura da unidade 1 nao voltou para a placa");
-        assert!(gpu.fill.unidade1.ligada, "a unidade 1 perdeu o GL_TEXTURE_2D");
-        assert_eq!(gpu.fill.unidade1.textura, 20, "a unidade 1 voltou com outro nome");
+        assert!(
+            gpu.texturas.contains_key(&10),
+            "a textura base nao voltou para a placa"
+        );
+        assert!(
+            gpu.texturas.contains_key(&20),
+            "a textura da unidade 1 nao voltou para a placa"
+        );
+        assert!(
+            gpu.fill.unidade1.ligada,
+            "a unidade 1 perdeu o GL_TEXTURE_2D"
+        );
+        assert_eq!(
+            gpu.fill.unidade1.textura, 20,
+            "a unidade 1 voltou com outro nome"
+        );
     }
 
     /// Desenha a mesma coisa nos dois e devolve os quadros em RGB565, para comparar.
@@ -3557,7 +4029,8 @@ mod tests {
         let do_software = sw.read_rect(0, 0, largura, altura);
         // A primeira linha do resultado é a de **baixo** da tela, que aqui é azul.
         assert_eq!(
-            do_software[largura + 1][2], 255,
+            do_software[largura + 1][2],
+            255,
             "no software a primeira linha lida devia ser a de baixo, azul"
         );
         assert_eq!(
@@ -3766,9 +4239,14 @@ mod tests {
                 "pixel ({x}, {y}) com escala 2"
             );
         }
-        let quadro = grande.quadro_na_placa().expect("textura grande para a janela");
+        let quadro = grande
+            .quadro_na_placa()
+            .expect("textura grande para a janela");
         assert_eq!(quadro.recorte, [1.0, 1.0]);
-        assert!(nativa.quadro_na_placa().is_none(), "na escala 1 a janela usa a tela de sempre");
+        assert!(
+            nativa.quadro_na_placa().is_none(),
+            "na escala 1 a janela usa a tela de sempre"
+        );
     }
 
     /// Com antialias a borda do triângulo mistura as duas cores, e o miolo fica como estava.
@@ -3796,7 +4274,7 @@ mod tests {
             uv: UV_PADRAO,
             uv1: UV_PADRAO,
             normal: [0.0, 0.0, 1.0],
-                fog: 1.0,
+            fog: 1.0,
         };
         gpu.draw(
             gles::GL_TRIANGLES,
@@ -3811,7 +4289,10 @@ mod tests {
             let (r, _, b) = pixel(&quadro, largura, x, largura - 1 - x);
             r > 0 && b > 0
         });
-        assert!(misturado, "algum pixel da diagonal devia misturar vermelho e azul");
+        assert!(
+            misturado,
+            "algum pixel da diagonal devia misturar vermelho e azul"
+        );
     }
 
     /// A tesoura de um retângulo cai no mesmo lugar do retângulo, com o `y` contado do topo.
@@ -3821,10 +4302,19 @@ mod tests {
     #[test]
     fn a_tesoura_de_um_retangulo_conta_o_y_do_topo() {
         // 42×64 a 21 da esquerda e 42 de baixo, numa tela de 640×480: o topo fica em 374.
-        assert_eq!(tesoura_no_anexo((21, 42, 42, 64), (640, 480), 0), (21, 374, 42, 64));
+        assert_eq!(
+            tesoura_no_anexo((21, 42, 42, 64), (640, 480), 0),
+            (21, 374, 42, 64)
+        );
         // Na proporção larga ele só se desloca; a tela inteira ganha os lados.
-        assert_eq!(tesoura_no_anexo((21, 42, 42, 64), (640, 480), 80), (101, 374, 42, 64));
-        assert_eq!(tesoura_no_anexo((0, 0, 640, 480), (640, 480), 80), (0, 0, 800, 480));
+        assert_eq!(
+            tesoura_no_anexo((21, 42, 42, 64), (640, 480), 80),
+            (101, 374, 42, 64)
+        );
+        assert_eq!(
+            tesoura_no_anexo((0, 0, 640, 480), (640, 480), 80),
+            (0, 0, 800, 480)
+        );
     }
 
     /// Na proporção larga, a tesoura do jogo não pode cortar os lados novos.
@@ -4002,7 +4492,7 @@ mod tests {
                         uv: UV_PADRAO,
                         uv1: UV_PADRAO,
                         normal: [0.0, 0.0, 1.0],
-                fog: 1.0,
+                        fog: 1.0,
                     };
                     // Um triângulo que cobre o centro, nas duas ordens de vértice.
                     let tri = match invertido {
@@ -4095,7 +4585,10 @@ mod tests {
         // O aviso de que o contexto morreu — é a mesma chamada que o `contexto_perdido` e o
         // `contexto_reset` do core fazem.
         a_placa_morreu(ENDERECO_FALSO);
-        assert!(viva.morreu(), "o estado não reconheceu o aviso da placa morta");
+        assert!(
+            viva.morreu(),
+            "o estado não reconheceu o aviso da placa morta"
+        );
         assert!(
             !viva.apaga_ao_morrer(),
             "o `Drop` chamaria delete_* com os ponteiros de função de um contexto morto"
@@ -4210,7 +4703,11 @@ mod tests {
         r.set_viewport(0, 0, largura as i32, altura as i32);
         r.set_clear_color([0.0, 0.0, 0.0, 1.0]);
         r.clear(gles::GL_COLOR_BUFFER_BIT);
-        triangulo(r, [1.0, 0.0, 0.0, 1.0], [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)]);
+        triangulo(
+            r,
+            [1.0, 0.0, 0.0, 1.0],
+            [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)],
+        );
         // Fechar o lote é o que o põe na placa — e é ali que o contexto volta ao anfitrião.
         r.descarrega_o_desenho();
     }
@@ -4218,7 +4715,11 @@ mod tests {
     /// O segundo lote: outro triângulo, na outra metade do quadro.
     #[cfg(feature = "gpu")]
     fn segundo_lote(r: &mut dyn Rasterizador) {
-        triangulo(r, [0.0, 1.0, 0.0, 1.0], [(1.0, -1.0), (1.0, 1.0), (-1.0, -1.0)]);
+        triangulo(
+            r,
+            [0.0, 1.0, 0.0, 1.0],
+            [(1.0, -1.0), (1.0, 1.0), (-1.0, -1.0)],
+        );
         r.descarrega_o_desenho();
     }
 
@@ -4342,7 +4843,11 @@ mod tests {
                 quadro.iter().all(|&p| p == vermelho),
                 "a tela leu o meio do quadro seguinte, com {amostras} amostra(s)"
             );
-            assert_eq!(gpu.read_rect(0, 0, 1, 1)[0], [0, 255, 0, 255], "o jogo lê o fundo");
+            assert_eq!(
+                gpu.read_rect(0, 0, 1, 1)[0],
+                [0, 255, 0, 255],
+                "o jogo lê o fundo"
+            );
 
             troca(&mut gpu);
             gpu.frame_rgb565_words(largura, altura, &mut quadro);
@@ -4389,7 +4894,10 @@ mod tests {
             .iter()
             .filter(|p| **p != [0, 0, 255, 255])
             .count();
-        assert_eq!(fora_do_azul, 0, "o fundo saiu recortado pela tesoura do sprite anterior");
+        assert_eq!(
+            fora_do_azul, 0,
+            "o fundo saiu recortado pela tesoura do sprite anterior"
+        );
     }
 
     #[cfg(feature = "gpu")]
@@ -4497,12 +5005,20 @@ mod tests {
             "o teste não discrimina: depois do lote o motor deveria estar com os seus ligados"
         );
         estado.devolve_ao_frontend();
-        assert_eq!(ligados(), [0, 0, 0], "VAO, programa e VBO do motor ficaram ligados");
+        assert_eq!(
+            ligados(),
+            [0, 0, 0],
+            "VAO, programa e VBO do motor ficaram ligados"
+        );
 
         // O quadro seguinte religa o que precisa e desenha.
         estado.desenha_no_fbo(Some(fbo.0.get()));
         segundo_lote(&mut estado);
-        assert_ne!(ligados(), [0, 0, 0], "o quadro seguinte não religou os objetos do motor");
+        assert_ne!(
+            ligados(),
+            [0, 0, 0],
+            "o quadro seguinte não religou os objetos do motor"
+        );
     }
 
     /// **A placa que morreu no meio do quadro não recebe desenho novo.**
@@ -4548,8 +5064,7 @@ mod tests {
         segundo_lote(&mut com_a_morta);
         let depois = com_a_morta.read_rect(0, 0, largura, altura);
         assert_eq!(
-            depois,
-            antes,
+            depois, antes,
             "a placa morta continuou desenhando: o estado não foi invalidado no aviso"
         );
 
@@ -4557,4 +5072,3 @@ mod tests {
         a_placa_nasceu(endereco_da_placa(&gl));
     }
 }
-
