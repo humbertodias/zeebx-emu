@@ -1091,6 +1091,17 @@ impl GpuState {
             return;
         }
         self.trocou = false;
+        // Na Vita a apresentação lê a textura na troca, quando o destino ainda é o
+        // quadro mostrado. A cópia abaixo só serviria a quem lesse a imagem antiga
+        // depois que o quadro seguinte já escreveu, e esse leitor é a janela no meio
+        // da volta. O blit ainda abre uma cena, desenha o quadro inteiro duas vezes
+        // e invalida a viewport do desenho que vem a seguir.
+        #[cfg(not(target_os = "vita"))]
+        self.copia_a_frente();
+    }
+
+    #[cfg(not(target_os = "vita"))]
+    fn copia_a_frente(&mut self) {
         let Some(destino) = self.quadro.as_ref() else {
             return;
         };
