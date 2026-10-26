@@ -861,6 +861,9 @@ impl Aplicativo {
                         jogo.sessao.retoma_o_contexto();
                     }
                 }
+                if placa::ativa() {
+                    placa::prepara_o_quadro();
+                }
                 let intermediario = jogo.sessao.mostra_quadro_intermediario();
                 if !intermediario {
                     passo = jogo.sessao.anda(fatia, &RITMO);

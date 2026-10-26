@@ -36,6 +36,122 @@ use super::rasterizer::{
 use glow::{self, HasContext};
 use std::collections::HashMap;
 
+// O vitaGL guarda aqui o bloco da textura ligada na unidade ativa.
+// `vglBufferData` só grava o ponteiro no buffer ligado: não pede memória.
+#[cfg(target_os = "vita")]
+unsafe extern "C" {
+    fn vglGetTexDataPointer(target: u32) -> *mut u8;
+    fn vglMemalign(alignment: u32, size: u32) -> *mut u8;
+    fn vglBufferData(target: u32, data: *const u8);
+}
+
+/// Copia o lote para um trecho estável e aponta o buffer para ele.
+///
+/// No vitaGL o desenho não leva os vértices: guarda o ponteiro e a placa lê
+/// depois, no fim da cena. Reescrever o mesmo bloco a cada sprite faz o
+/// seguinte ficar com o `uv` do anterior — um quadrado de outra folha. O anel
+/// só volta ao começo quando enche, e o `glFinish` espera a placa soltar os
+/// ponteiros. `glBufferData` não serve: pede o anel inteiro de novo e, sem
+/// página, dorme um segundo.
+#[cfg(target_os = "vita")]
+fn grava_no_bloco_vita(gl: &glow::Context, vbo: glow::Buffer, bytes: &[u8]) -> bool {
+    use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    static BLOCO: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+    static BLOCO_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static CURSOR: AtomicUsize = AtomicUsize::new(0);
+    if bytes.is_empty() {
+        return true;
+    }
+    // 8 MiB cabem um quadro de sprites inteiro. Acabar no meio do quadro
+    // chamaria `glFinish` com a cena aberta.
+    const ANEL: usize = 8 << 20;
+    let passo = bytes.len().div_ceil(16) * 16;
+    let mut base = BLOCO.load(Ordering::Relaxed);
+    let mut capacidade = BLOCO_BYTES.load(Ordering::Relaxed);
+    if base.is_null() {
+        let tamanho = passo.max(ANEL);
+        let Ok(tamanho_u32) = u32::try_from(tamanho) else {
+            return false;
+        };
+        base = unsafe { vglMemalign(16, tamanho_u32) };
+        if base.is_null() {
+            return false;
+        }
+        BLOCO.store(base, Ordering::Relaxed);
+        BLOCO_BYTES.store(tamanho, Ordering::Relaxed);
+        capacidade = tamanho;
+        CURSOR.store(0, Ordering::Relaxed);
+    }
+    if passo > capacidade {
+        return false;
+    }
+    let mut cursor = CURSOR.load(Ordering::Relaxed);
+    if cursor.saturating_add(passo) > capacidade {
+        unsafe { gl.finish() };
+        cursor = 0;
+    }
+    let destino = unsafe { base.add(cursor) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), destino, bytes.len());
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        vglBufferData(glow::ARRAY_BUFFER, destino);
+    }
+    CURSOR.store(cursor + passo, Ordering::Relaxed);
+    true
+}
+
+/// Grava RGBA8 no bloco que o vitaGL já alocou para a textura ligada.
+///
+/// `glTexImage2D` e `glTexSubImage2D` pedem um bloco novo. Quando a partição física
+/// do jogo acaba, o `glClear` seguinte morre em `sceGxmReserveVertexDefaultUniformBuffer`:
+/// foi o coredump com a pilha em `GpuState::destino`. O ponteiro devolvido é o bloco
+/// da primeira imagem, RGBA linear, com a largura arredondada para cima a 8 — o passo
+/// que `gpu_alloc_texture` gravou.
+#[cfg(target_os = "vita")]
+unsafe fn escreve_rgba_vita(
+    pixels: &[u8],
+    x: usize,
+    y: usize,
+    largura: usize,
+    altura: usize,
+    largura_total: usize,
+    altura_total: usize,
+) -> bool {
+    if largura == 0
+        || altura == 0
+        || largura_total == 0
+        || altura_total == 0
+        || x.saturating_add(largura) > largura_total
+        || y.saturating_add(altura) > altura_total
+    {
+        return false;
+    }
+    let passo_fonte = largura * 4;
+    let preciso = passo_fonte.saturating_mul(altura);
+    if pixels.len() < preciso {
+        return false;
+    }
+    let ptr = unsafe { vglGetTexDataPointer(glow::TEXTURE_2D) };
+    if ptr.is_null() {
+        return false;
+    }
+    let passo_destino = largura_total.div_ceil(8) * 8 * 4;
+    unsafe {
+        if x == 0 && largura == largura_total && passo_fonte == passo_destino {
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr.add(y * passo_destino), preciso);
+        } else {
+            for linha in 0..altura {
+                std::ptr::copy_nonoverlapping(
+                    pixels.as_ptr().add(linha * passo_fonte),
+                    ptr.add((y + linha) * passo_destino + x * 4),
+                    passo_fonte,
+                );
+            }
+        }
+    }
+    true
+}
+
 /// `GL_TEXTURE_MAX_ANISOTROPY` e o máximo que a placa aceita, da extensão
 /// `EXT_texture_filter_anisotropic` (núcleo no OpenGL 4.6).
 const TEXTURE_MAX_ANISOTROPY: u32 = 0x84fe;
@@ -45,6 +161,8 @@ const MAX_TEXTURE_MAX_ANISOTROPY: u32 = 0x84ff;
 const FLOATS_POR_VERTICE: usize = 4 + 4 + 2 + 1 + 2;
 
 /// Quantos vértices cabem no anel do buffer de vértices. Ver [`GpuState::anel`].
+/// Na Vita o lote não passa por esse anel.
+#[cfg_attr(target_os = "vita", allow(dead_code))]
 const VERTICES_NO_ANEL: usize = 1 << 16;
 
 /// Quantos vértices um lote junta antes de ir à placa mesmo sem mudança de estado.
@@ -58,6 +176,9 @@ struct Textura {
     /// O maior nível de mipmap já enviado. Um filtro que peça mipmap sem a cadeia completa
     /// desenha preto no OpenGL — então, quando só existe o nível zero, o filtro é rebaixado.
     maior_nivel: u32,
+    /// O nível zero já tem armazenamento na placa. Repetir a imagem no mesmo tamanho
+    /// não chama `glTexImage2D` de novo: no vitaGL isso pede outro bloco físico.
+    nivel_zero: bool,
     crop: [i32; 4],
     filtro: u32,
     filtro_min: u32,
@@ -516,6 +637,8 @@ pub struct GpuState {
     soltos: Vec<Vertex>,
     /// A textura de apoio do [`GpuState::import_rgb565_changes`].
     ponte: glow::Texture,
+    /// O tamanho já alocado de [`GpuState::ponte`]. `None` até o primeiro envio.
+    ponte_medida: Option<(i32, i32)>,
     texturas: HashMap<u32, Textura>,
     /// Buffers reaproveitados entre chamadas, para não pedir memória por quadro.
     vertices: Vec<f32>,
@@ -692,6 +815,7 @@ impl GpuState {
             estado_do_lote: None,
             soltos: Vec::new(),
             ponte,
+            ponte_medida: None,
             texturas: HashMap::new(),
             vertices: Vec::new(),
             pixels: Vec::new(),
@@ -1210,6 +1334,7 @@ impl GpuState {
                     largura: salva.width,
                     altura: salva.height,
                     maior_nivel,
+                    nivel_zero: true,
                     crop: salva.crop,
                     filtro: salva.filter,
                     filtro_min: salva.min_filter,
@@ -1601,25 +1726,34 @@ impl GpuState {
                 }
                 self.vao_pronto = true;
             }
-            let (capacidade, livre) = self.anel;
-            if livre + quantos > capacidade {
-                // O buffer novo não espera os desenhos que ainda usam o antigo: o driver
-                // entrega outra memória, e a de antes é solta quando eles terminam.
-                let capacidade = VERTICES_NO_ANEL.max(quantos);
-                gl.buffer_data_size(
-                    glow::ARRAY_BUFFER,
-                    (capacidade * FLOATS_POR_VERTICE * 4) as i32,
-                    glow::STREAM_DRAW,
-                );
-                self.anel = (capacidade, 0);
-            }
-            let primeiro = self.anel.1;
-            gl.buffer_sub_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                primeiro as i32 * passo,
-                bytes_de_f32(&self.vertices),
-            );
-            self.anel.1 += quantos;
+            let bytes = bytes_de_f32(&self.vertices);
+            // Na Vita cada lote fica num trecho próprio: a placa lê o ponteiro no fim
+            // da cena. Nas outras, o anel pede outro bloco ao encher, e o antigo só se
+            // solta quando os desenhos que o usam terminam.
+            #[cfg(target_os = "vita")]
+            let primeiro = if grava_no_bloco_vita(gl, self.vbo, bytes) {
+                0
+            } else {
+                self.devolve_o_contexto();
+                return;
+            };
+            #[cfg(not(target_os = "vita"))]
+            let primeiro = {
+                let (capacidade, mut livre) = self.anel;
+                if livre + quantos > capacidade {
+                    let capacidade = VERTICES_NO_ANEL.max(quantos);
+                    gl.buffer_data_size(
+                        glow::ARRAY_BUFFER,
+                        (capacidade * FLOATS_POR_VERTICE * 4) as i32,
+                        glow::STREAM_DRAW,
+                    );
+                    self.anel.0 = capacidade;
+                    livre = 0;
+                }
+                gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, livre as i32 * passo, bytes);
+                self.anel.1 = livre + quantos;
+                livre
+            };
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, textura);
             uniforme_i32(gl, &self.uniformes, self.programa, "amostra", 0);
@@ -3176,6 +3310,7 @@ impl Rasterizador for GpuState {
                         largura: width,
                         altura: height,
                         maior_nivel: 0,
+                        nivel_zero: false,
                         crop,
                         filtro,
                         filtro_min,
@@ -3185,29 +3320,61 @@ impl Rasterizador for GpuState {
                 objeto
             }
         };
+        // No vitaGL, `glTexImage2D` e `glTexSubImage2D` pedem bloco novo. A imagem que
+        // o jogo reenvia no mesmo tamanho escreve no ponteiro que a primeira alocação
+        // deixou; foi o esgotamento dessa partição que derrubou o `glClear`.
+        let reaproveita = level == 0
+            && self
+                .texturas
+                .get(&name)
+                .is_some_and(|t| t.nivel_zero && t.largura == width && t.altura == height);
+        let mut precisa_imagem = !reaproveita;
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(objeto));
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                level as i32,
-                formato_de_cor(&gl) as i32,
-                width as i32,
-                height as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&bytes)),
-            );
+            if reaproveita {
+                #[cfg(target_os = "vita")]
+                {
+                    precisa_imagem = !escreve_rgba_vita(&bytes, 0, 0, width, height, width, height);
+                }
+                #[cfg(not(target_os = "vita"))]
+                {
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        width as i32,
+                        height as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(&bytes)),
+                    );
+                }
+            }
+            if precisa_imagem {
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    level as i32,
+                    formato_de_cor(&gl) as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&bytes)),
+                );
+            }
         }
         if let Some(t) = self.texturas.get_mut(&name) {
             if level == 0 {
                 t.largura = width;
                 t.altura = height;
+                t.nivel_zero = true;
             }
             t.maior_nivel = t.maior_nivel.max(level);
         }
-        if let Some(t) = self.texturas.get(&name) {
+        if precisa_imagem && let Some(t) = self.texturas.get(&name) {
             self.parametros(t);
         }
         self.estado.upload_level(name, level, width, height, pixels);
@@ -3228,21 +3395,36 @@ impl Rasterizador for GpuState {
             if let Some(t) = self.texturas.get(&name) {
                 let bytes: Vec<u8> = pixels.iter().flatten().copied().collect();
                 self.medida.bytes_enviados += bytes.len() as u64;
+                let (largura, altura, objeto) = (t.largura, t.altura, t.objeto);
                 unsafe {
                     let gl = &self.gl;
-                    gl.bind_texture(glow::TEXTURE_2D, Some(t.objeto));
+                    gl.bind_texture(glow::TEXTURE_2D, Some(objeto));
                     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-                    gl.tex_sub_image_2d(
-                        glow::TEXTURE_2D,
-                        0,
-                        x as i32,
-                        y as i32,
-                        width as i32,
-                        height as i32,
-                        glow::RGBA,
-                        glow::UNSIGNED_BYTE,
-                        glow::PixelUnpackData::Slice(Some(&bytes)),
+                    #[cfg(target_os = "vita")]
+                    let escreveu = escreve_rgba_vita(
+                        &bytes,
+                        x as usize,
+                        y as usize,
+                        width as usize,
+                        height as usize,
+                        largura,
+                        altura,
                     );
+                    #[cfg(not(target_os = "vita"))]
+                    let escreveu = false;
+                    if !escreveu {
+                        gl.tex_sub_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            x as i32,
+                            y as i32,
+                            width as i32,
+                            height as i32,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(&bytes)),
+                        );
+                    }
                 }
             }
         }
@@ -3611,25 +3793,55 @@ impl Rasterizador for GpuState {
             let gl = &self.gl;
             gl.bind_texture(glow::TEXTURE_2D, Some(self.ponte));
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                formato_de_cor(&gl) as i32,
-                colunas as i32,
-                linhas as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&self.pixels)),
-            );
-            for (nome, valor) in [
-                (glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32),
-                (glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32),
-                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32),
-                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32),
-                (glow::TEXTURE_MAX_LEVEL, 0),
-            ] {
-                gl.tex_parameter_i32(glow::TEXTURE_2D, nome, valor);
+            let medida = (colunas as i32, linhas as i32);
+            // A ponte muda todo quadro em que o 2D muda. No vitaGL isso escreve no
+            // bloco da primeira imagem; `glTexSubImage2D` pedia outro e a partição
+            // física acabava no `glClear`.
+            let mesma = self.ponte_medida == Some(medida);
+            let mut precisa_imagem = !mesma;
+            if mesma {
+                #[cfg(target_os = "vita")]
+                {
+                    precisa_imagem =
+                        !escreve_rgba_vita(&self.pixels, 0, 0, colunas, linhas, colunas, linhas);
+                }
+                #[cfg(not(target_os = "vita"))]
+                {
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        medida.0,
+                        medida.1,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(&self.pixels)),
+                    );
+                }
+            }
+            if precisa_imagem {
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    formato_de_cor(&gl) as i32,
+                    medida.0,
+                    medida.1,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&self.pixels)),
+                );
+                for (nome, valor) in [
+                    (glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32),
+                    (glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32),
+                    (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32),
+                    (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32),
+                    (glow::TEXTURE_MAX_LEVEL, 0),
+                ] {
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, nome, valor);
+                }
+                self.ponte_medida = Some(medida);
             }
         }
         // O retângulo cobre a superfície dentro do quadro. As coordenadas já saem prontas, então

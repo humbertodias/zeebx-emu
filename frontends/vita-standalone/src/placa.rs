@@ -6,6 +6,7 @@
 //! `sceDisplaySetFrameBuf`.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use glow::HasContext;
@@ -26,16 +27,23 @@ static ESTADO: Mutex<Option<Estado>> = Mutex::new(None);
 
 unsafe extern "C" {
     fn vglGetProcAddress(name: *const i8) -> *const c_void;
-    fn vglInitExtended(
+    fn vglInitWithCustomSizes(
         legacy_pool_size: i32,
         width: i32,
         height: i32,
-        ram_threshold: i32,
+        ram_size: i32,
+        cdram_size: i32,
+        phycont_size: i32,
+        cdlg_size: i32,
         msaa: i32,
     ) -> i32;
     fn vglSwapBuffers(has_common_dialog: u8);
     fn vglWaitVblankStart(enable: u8);
     fn vglSetShaderCachePath(path: *const i8);
+    fn vglMemalign(alignment: u32, size: u32) -> *mut u8;
+    fn vglBufferData(target: u32, data: *const u8);
+    /// Só para achar, no binário já relocado, o pool circular de vértices.
+    fn vglAllocFromScratch(size: usize) -> *mut u8;
 }
 
 const VERTICE: &str = r#"
@@ -74,8 +82,19 @@ pub fn abre() -> Abertura {
     // O cache tem de existir antes do init: a primeira compilação passa pelo SceShaccCg.
     unsafe {
         vglSetShaderCachePath(c"ux0:data/zeebx/shader_cache".as_ptr());
-        // 1 MiB de pool legado, 16 MiB de limiar de RAM, sem multisample. A tela é a nativa.
-        let codigo = vglInitExtended(0x10_0000, 960, 544, 0x100_0000, 0);
+        // O `vglInitExtended` trata o quarto argumento como o que sobra, não como o
+        // tamanho do pool. Com 16 MiB de limiar ele ficou com o resto da partição do
+        // usuário: no coredump `0x000136399b` o `ram_mempool` tinha 137 MiB, a CDRAM
+        // 96 MiB e a PHYCONT 26 MiB, por cima do heap de 192 MiB. O `glClear` seguinte
+        // morreu em `sceGxmReserveVertexDefaultUniformBuffer` sem página física
+        // (`ScePhyMemPartGame`). Aqui o tamanho é o bloco. 16 MiB de RAM deixam o
+        // resto da partição para o GXM e para os blocos grandes do jogo; 64 MiB de
+        // CDRAM cabem o anel de vértices de 32 MiB e as texturas; 8 MiB de PHYCONT
+        // cabem os alvos de render. O diálogo fica com o mesmo `0x8C6000` que o
+        // `vglInitExtended` gravava.
+        let codigo = vglInitWithCustomSizes(
+            0x10_0000, 960, 544, 0x100_0000, 0x400_0000, 0x80_0000, 0x8C_6000, 0,
+        );
         // O cabeçalho diz `GLboolean`, mas o binário devolve 0 quando 960×544 cabe na
         // tela e 1 quando precisa ajustar. Os dois já subiram o GXM. Ler o 0 como
         // falha pedia de novo a PHYCONT e a CDRAM, que o init tinha acabado de tomar:
@@ -207,6 +226,116 @@ pub fn mostra_rgba(pixels: &[u32], w: i32, h: i32) {
     }
 }
 
+/// Devolve o pool de vértices do vitaGL ao começo quando a folga acaba.
+///
+/// Cada `glDrawArrays` copia os vértices para esse pool, e o GXM ainda lê a
+/// cópia depois da troca de quadro. O cursor só anda para a frente: passado o
+/// fim, o desenho pede um bloco e o enfileira para o coletor, que larga de
+/// devolver o que enfileirou. Voltar o cursor ao começo em todo quadro pisa na
+/// cópia que o quadro da tela ainda usa — o sprite sai com o uv de outro, um
+/// quadrado de outra folha. A folga cabe vários quadros. Só rebobinamos quando
+/// ela acaba, e o `glFinish` espera o GXM soltar o pool antes.
+pub fn prepara_o_quadro() {
+    let Some(estrutura) = estrutura_do_pool() else {
+        return;
+    };
+    // Um quadro de sprites fica abaixo disto. Com menos folga, o próximo
+    // desenho estoura o pool.
+    const MARGEM: u32 = 6 << 20;
+    let (base, cursor, limite) = unsafe {
+        let campos = estrutura as *const u32;
+        (
+            campos.add(0x58 / 4).read(),
+            campos.add(0x70 / 4).read(),
+            campos.add(0x88 / 4).read(),
+        )
+    };
+    if base != 0 && cursor >= base && limite.saturating_sub(cursor) > MARGEM {
+        return;
+    }
+    if let Some(gl) = contexto() {
+        unsafe { gl.finish() };
+    }
+    if base != 0 {
+        unsafe {
+            let campos = estrutura as *mut u32;
+            campos.add(0x70 / 4).write(base);
+        }
+    }
+}
+
+static AVISO_DO_POOL: AtomicBool = AtomicBool::new(false);
+static APRESENTACAO: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+static APRESENTACAO_LIGADA: AtomicBool = AtomicBool::new(false);
+
+/// O `vglAllocFromScratch` carrega o endereço do pool com `movw`/`movt`. No processo
+/// esses imediatos já estão relocados; o valor no ELF não serve.
+fn estrutura_do_pool() -> Option<*mut u8> {
+    static CACHE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
+    let ja = CACHE.load(Ordering::Relaxed);
+    if !ja.is_null() {
+        return Some(ja);
+    }
+    let entrada = (vglAllocFromScratch as *const () as usize) & !1;
+    let codigo = unsafe { std::slice::from_raw_parts(entrada as *const u16, 16) };
+    let mut baixo = None;
+    let mut alto = None;
+    let mut i = 0;
+    while i + 1 < codigo.len() {
+        let hw1 = codigo[i];
+        let hw2 = codigo[i + 1];
+        let opcode = hw1 & 0xfbf0;
+        let movt = match opcode {
+            0xf240 => Some(false),
+            0xf2c0 => Some(true),
+            _ => None,
+        };
+        if let Some(movt) = movt {
+            let rd = (hw2 >> 8) & 0xf;
+            if rd == 3 {
+                let imm = ((u32::from(hw1 & 0xf)) << 12)
+                    | ((u32::from((hw1 >> 10) & 1)) << 11)
+                    | ((u32::from((hw2 >> 12) & 7)) << 8)
+                    | u32::from(hw2 & 0xff);
+                if movt {
+                    alto.get_or_insert(imm);
+                } else {
+                    baixo.get_or_insert(imm);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        // Thumb de 32 bits começa com 11101, 1111 ou 11110. O resto é 16 bits.
+        let trinta_e_dois = hw1 >= 0xe800;
+        i += if trinta_e_dois { 2 } else { 1 };
+    }
+    let (Some(baixo), Some(alto)) = (baixo, alto) else {
+        if !AVISO_DO_POOL.swap(true, Ordering::Relaxed) {
+            anota("não achei o pool de vértices do vitaGL");
+        }
+        return None;
+    };
+    let endereco = ((alto << 16) | baixo) as *mut u8;
+    // Base e limite do pool 0. O init grava os dois; a folga é 32 MiB / 3.
+    let (base, limite) = unsafe {
+        let campos = endereco as *const u32;
+        (campos.add(0x58 / 4).read(), campos.add(0x88 / 4).read())
+    };
+    let folga = limite.wrapping_sub(base);
+    if base == 0 || !(1 << 20..16 << 20).contains(&folga) {
+        if !AVISO_DO_POOL.swap(true, Ordering::Relaxed) {
+            anota("o pool de vértices do vitaGL não está onde o scratch aponta");
+        }
+        return None;
+    }
+    CACHE.store(endereco, Ordering::Relaxed);
+    if !AVISO_DO_POOL.swap(true, Ordering::Relaxed) {
+        anota("o pool de vértices do vitaGL rebobina quando a folga acaba");
+    }
+    Some(endereco)
+}
+
 /// O quadro do jogo, já na placa. `x` e `y` são o canto superior esquerdo, em pixels da tela.
 pub fn mostra_textura(id: u32, x: i32, y: i32, w: i32, h: i32) {
     let guarda = ESTADO.lock().unwrap_or_else(|e| e.into_inner());
@@ -326,11 +455,24 @@ unsafe fn pinta(estado: &Estado, textura: u32, x: i32, y: i32, w: i32, h: i32) {
             glow::CLAMP_TO_EDGE as i32,
         );
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(estado.vbo));
-        gl.buffer_data_u8_slice(
-            glow::ARRAY_BUFFER,
-            bytemuck_f32(&vertices),
-            glow::STREAM_DRAW,
-        );
+        // `glBufferData` pede um bloco novo a cada troca. O quadrado da tela cabe num
+        // bloco só, escrito por cima: o desenho copia os seis vértices antes de voltar.
+        let bytes = bytemuck_f32(&vertices);
+        let mut bloco = APRESENTACAO.load(Ordering::Relaxed);
+        if bloco.is_null() {
+            bloco = vglMemalign(16, bytes.len() as u32);
+            if !bloco.is_null() {
+                APRESENTACAO.store(bloco, Ordering::Relaxed);
+            }
+        }
+        if bloco.is_null() {
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
+        } else {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), bloco, bytes.len());
+            if !APRESENTACAO_LIGADA.swap(true, Ordering::Relaxed) {
+                vglBufferData(glow::ARRAY_BUFFER, bloco);
+            }
+        }
         let passo = 4 * 4;
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, passo, 0);
