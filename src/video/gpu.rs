@@ -633,6 +633,10 @@ pub struct GpuState {
     /// [`GpuState::descarrega`].
     lote: Vec<f32>,
     estado_do_lote: Option<(Estado, bool)>,
+    /// Os `glDrawTex` ainda não enviados. Cada um é um retângulo; seguidos, com a mesma
+    /// textura e o mesmo estado, viram um desenho só. Ver [`GpuState::draw_texture`].
+    sprites: Vec<f32>,
+    sprites_estado: Option<Estado>,
     /// Os vértices transformados de um desenho, antes de virarem triângulos no lote.
     soltos: Vec<Vertex>,
     /// A textura de apoio do [`GpuState::import_rgb565_changes`].
@@ -813,6 +817,8 @@ impl GpuState {
             vao_pronto: false,
             lote: Vec::new(),
             estado_do_lote: None,
+            sprites: Vec::new(),
+            sprites_estado: None,
             soltos: Vec::new(),
             ponte,
             ponte_medida: None,
@@ -1382,6 +1388,8 @@ impl GpuState {
         self.placa.esquece_o_ligado();
         self.lote.clear();
         self.estado_do_lote = None;
+        self.sprites.clear();
+        self.sprites_estado = None;
         self.soltos.clear();
         self.vertices.clear();
         self.sujo = true;
@@ -1648,6 +1656,13 @@ impl GpuState {
     /// antes dele. As mudanças de estado não precisam: elas mudam o `fill`, e o `fill` diferente
     /// já fecha o lote no próximo desenho.
     fn descarrega(&mut self) {
+        // O retângulo veio antes do polígono que está esperando, ou o contrário: a ordem
+        // em que o jogo pediu tem de ser a ordem na placa.
+        self.descarrega_sprites();
+        self.descarrega_lote();
+    }
+
+    fn descarrega_lote(&mut self) {
         let Some((estado, perspectiva)) = self.estado_do_lote.take() else {
             return;
         };
@@ -1661,6 +1676,21 @@ impl GpuState {
         self.em_perspectiva = false;
         self.lote = std::mem::replace(&mut self.vertices, anteriores);
         self.lote.clear();
+        self.fill = atual;
+    }
+
+    fn descarrega_sprites(&mut self) {
+        let Some(estado) = self.sprites_estado.take() else {
+            return;
+        };
+        if self.sprites.is_empty() {
+            return;
+        }
+        let atual = std::mem::replace(&mut self.fill, estado);
+        let anteriores = std::mem::replace(&mut self.vertices, std::mem::take(&mut self.sprites));
+        self.submete_com(glow::TRIANGLES, -1.0, None);
+        self.sprites = std::mem::replace(&mut self.vertices, anteriores);
+        self.sprites.clear();
         self.fill = atual;
     }
 
@@ -1830,6 +1860,12 @@ impl GpuState {
             // **Nao desligue aqui.** Desligar no fim de cada desenho era o custo que este cache
             // veio tirar: um programa a menos por lote e uma revalidacao a menos em cada um.
         }
+        // Na Vita quem mais usa o contexto é a apresentação, uma vez por quadro, e ela
+        // mesma liga framebuffer, tesoura e programa. Devolver aqui desligava mistura,
+        // profundidade e o programa a cada sprite — o custo que invalidar o cache a
+        // cada lote já tinha mostrado no RetroArch. Correr o personagem é mais sprites.
+        // O `retoma_o_contexto` depois da troca esquece o espelho.
+        #[cfg(not(target_os = "vita"))]
         self.devolve_o_contexto();
         self.sujo = true;
     }
@@ -3445,6 +3481,8 @@ impl Rasterizador for GpuState {
             _ if linhas => glow::TRIANGLES,
             _ => return,
         };
+        // O polígono vem depois dos retângulos que ainda estão no lote.
+        self.descarrega_sprites();
         self.estado.etapa_de_vertice(vertices);
         let extra = self.extra();
         let perspectiva = extra > 0 && self.estado.projecao_em_perspectiva();
@@ -3513,7 +3551,9 @@ impl Rasterizador for GpuState {
     }
 
     fn draw_texture(&mut self, x: f32, y: f32, z: f32, width: f32, height: f32) {
-        self.descarrega();
+        // O polígono que já estava juntado sai antes. O lote dos retângulos fica: o
+        // próximo `glDrawTex` com a mesma textura e o mesmo estado entra nele.
+        self.descarrega_lote();
         let ligada = self.fill.textura_ligada;
         let Some(t) = self.texturas.get(&ligada) else {
             return;
@@ -3544,30 +3584,42 @@ impl Rasterizador for GpuState {
             ([direita, base], [s1, t0]),
             ([direita, topo], [s1, t1]),
         ];
-        self.vertices.clear();
-        for ([sx, sy], uv) in cantos {
-            let v = Vertex {
-                normal: [0.0, 0.0, 1.0],
-                uv1: UV_PADRAO,
-                fog: 1.0,
-                position: [
-                    ((sx - vx as f32) / vw as f32) * 2.0 - 1.0,
-                    1.0 - ((sy - vy as f32) / vh as f32) * 2.0,
-                    z * 2.0 - 1.0,
-                    1.0,
-                ],
-                color: cor,
-                uv: [uv[0], uv[1], 0.0, 1.0],
-            };
-            self.poe(&v);
-        }
+        let vertice = |sx: f32, sy: f32, uv: [f32; 2]| Vertex {
+            normal: [0.0, 0.0, 1.0],
+            uv1: UV_PADRAO,
+            fog: 1.0,
+            position: [
+                ((sx - vx as f32) / vw as f32) * 2.0 - 1.0,
+                1.0 - ((sy - vy as f32) / vh as f32) * 2.0,
+                z * 2.0 - 1.0,
+                1.0,
+            ],
+            color: cor,
+            uv: [uv[0], uv[1], 0.0, 1.0],
+        };
+        let quad = [
+            vertice(cantos[0].0[0], cantos[0].0[1], cantos[0].1),
+            vertice(cantos[1].0[0], cantos[1].0[1], cantos[1].1),
+            vertice(cantos[2].0[0], cantos[2].0[1], cantos[2].1),
+            vertice(cantos[3].0[0], cantos[3].0[1], cantos[3].1),
+        ];
         // A extensão não define orientação para o retângulo, então descartá-lo por face seria
-        // descartar um desenho que o jogo espera ver.
-        let guarda = self.fill.clone();
-        self.fill.descarte = false;
-        self.fill.texturando = true;
-        self.submete_com(glow::TRIANGLE_FAN, -1.0, None);
-        self.fill = guarda;
+        // descartar um desenho que o jogo espera ver. O vitaGL cobra a cena inteira em cada
+        // `glDrawArrays`. Correr o personagem é mais destes retângulos, quase todos na mesma
+        // folha: juntos, vão numa chamada só. O leque vira dois triângulos para poder
+        // sentar ao lado do próximo.
+        let mut estado = self.fill.clone();
+        estado.descarte = false;
+        estado.texturando = true;
+        let mesmo = self.sprites_estado.as_ref() == Some(&estado)
+            && self.sprites.len() + 6 * FLOATS_POR_VERTICE <= VERTICES_NO_LOTE * FLOATS_POR_VERTICE;
+        if !mesmo {
+            self.descarrega_sprites();
+            self.sprites_estado = Some(estado);
+        }
+        for i in [0, 1, 2, 0, 2, 3] {
+            poe_em(&mut self.sprites, &quad[i]);
+        }
     }
 
     /// **O quadro da placa está guardado com a linha 0 no topo**, porque o Y é virado no shader

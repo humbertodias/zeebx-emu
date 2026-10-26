@@ -878,22 +878,8 @@ impl Aplicativo {
                     classe = jogo.sessao.classe();
                     pela = jogo.pela_z_wheel;
                 }
-                if som.porta >= 0 {
-                    let agora_ms = jogo.sessao.clock_ms();
-                    let virt = u64::from(agora_ms.wrapping_sub(jogo.relogio));
-                    jogo.relogio = agora_ms;
-                    let real = jogo.ultimo_som.elapsed().as_millis() as u64;
-                    jogo.ultimo_som = Instant::now();
-                    let devidas = som::amostras_devidas(real, virt, som::TAXA);
-                    jogo.mixer.render_into(devidas, &mut jogo.mix);
-                    jogo.pcm.clear();
-                    jogo.pcm.extend(
-                        jogo.mix
-                            .iter()
-                            .map(|amostra| (amostra.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16),
-                    );
-                    som.anel.empurra(&jogo.pcm);
-                }
+                // A imagem sai antes do mix. O som não muda o quadro, e misturá-lo
+                // antes da troca atrasava o comando pelo tempo do render.
                 if intermediario || passo == Step::Presented {
                     // A textura do destino, 1:1 no centro. Ler o quadro de volta para a CPU
                     // jogaria fora o motivo de desenhar na placa.
@@ -918,6 +904,22 @@ impl Aplicativo {
                 } else if passo == Step::Ahead {
                     // Adiantado, a volta volta na hora. Sem esta espera o laço gira no vazio.
                     unsafe { sceDisplayWaitVblankStart() };
+                }
+                if som.porta >= 0 {
+                    let agora_ms = jogo.sessao.clock_ms();
+                    let virt = u64::from(agora_ms.wrapping_sub(jogo.relogio));
+                    jogo.relogio = agora_ms;
+                    let real = jogo.ultimo_som.elapsed().as_millis() as u64;
+                    jogo.ultimo_som = Instant::now();
+                    let devidas = som::amostras_devidas(real, virt, som::TAXA);
+                    jogo.mixer.render_into(devidas, &mut jogo.mix);
+                    jogo.pcm.clear();
+                    jogo.pcm.extend(
+                        jogo.mix
+                            .iter()
+                            .map(|amostra| (amostra.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16),
+                    );
+                    som.anel.empurra(&jogo.pcm);
                 }
             }
         }

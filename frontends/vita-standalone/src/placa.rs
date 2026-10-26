@@ -39,6 +39,7 @@ unsafe extern "C" {
     ) -> i32;
     fn vglSwapBuffers(has_common_dialog: u8);
     fn vglWaitVblankStart(enable: u8);
+    fn vglUseTripleBuffering(usage: u8);
     fn vglSetShaderCachePath(path: *const i8);
     fn vglMemalign(alignment: u32, size: u32) -> *mut u8;
     fn vglBufferData(target: u32, data: *const u8);
@@ -82,6 +83,11 @@ pub fn abre() -> Abertura {
     // O cache tem de existir antes do init: a primeira compilação passa pelo SceShaccCg.
     unsafe {
         vglSetShaderCachePath(c"ux0:data/zeebx/shader_cache".as_ptr());
+        // O byte nasce em 3. O terceiro buffer é um quadro a mais entre o
+        // comando e a imagem: o personagem já andou, e a tela ainda mostra o
+        // quadro anterior. O mesmo byte diz em quantos pools o init reparte o
+        // anel de vértices, então tem de ser antes.
+        vglUseTripleBuffering(0);
         // O `vglInitExtended` trata o quarto argumento como o que sobra, não como o
         // tamanho do pool. Com 16 MiB de limiar ele ficou com o resto da partição do
         // usuário: no coredump `0x000136399b` o `ram_mempool` tinha 137 MiB, a CDRAM
@@ -317,13 +323,14 @@ fn estrutura_do_pool() -> Option<*mut u8> {
         return None;
     };
     let endereco = ((alto << 16) | baixo) as *mut u8;
-    // Base e limite do pool 0. O init grava os dois; a folga é 32 MiB / 3.
+    // Base e limite do pool 0. O init grava os dois; a folga é 32 MiB
+    // repartidos pelos buffers da tela. Com dois, cada pool fica em 16 MiB.
     let (base, limite) = unsafe {
         let campos = endereco as *const u32;
         (campos.add(0x58 / 4).read(), campos.add(0x88 / 4).read())
     };
     let folga = limite.wrapping_sub(base);
-    if base == 0 || !(1 << 20..16 << 20).contains(&folga) {
+    if base == 0 || !(1 << 20..17 << 20).contains(&folga) {
         if !AVISO_DO_POOL.swap(true, Ordering::Relaxed) {
             anota("o pool de vértices do vitaGL não está onde o scratch aponta");
         }
